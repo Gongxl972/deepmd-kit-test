@@ -24,6 +24,11 @@ jobs:
         group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         python: ["3.10", "3.13"]
 
+    # 新增：允许下载其他 workflow 的 artifact（用于跨 PR 共享 testmon DB）
+    permissions:
+      id-token: write
+      actions: read
+
     steps:
       # 关键：必须 fetch-depth: 0，否则 git diff 在 PR 中无法获取 base commit
       - uses: actions/checkout@v6
@@ -52,8 +57,22 @@ jobs:
           HOROVOD_WITH_MPI: 1
           CMAKE_POLICY_VERSION_MINIMUM: 3.5
 
-      # 恢复 Testmon 数据库 (.testmondata)
-      # PR 会自动从 base branch (main) 继承缓存
+      # ==================== 新增：跨 PR 共享 Seed 数据库 ====================
+      # PR 运行时优先从 main 分支下载全量生成的 .testmondata
+      - name: Download seed testmon DB from main branch
+        if: github.event_name == 'pull_request'
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: test_python.yml  # 当前 workflow 名称
+          branch: test/testmon #main
+          name: testmon-db-${{ matrix.python }}  # 按 Python 版本区分数据库
+          path: .  # 直接下载到仓库根目录
+          search_artifacts: true
+          if_no_artifact_found: warn  # 没找到 Seed 包只警告，不中断流程
+        continue-on-error: true  # 下载失败自动回退到 Cache 机制
+      # ======================================================================
+
+      # 恢复 Testmon 数据库（兜底逻辑：Seed 下载失败时用）
       - name: Restore testmon DB
         uses: actions/cache@v5
         with:
@@ -72,7 +91,6 @@ jobs:
           GITHUB_PR_HEAD_SHA: ${{ github.sha }}
 
       # 智能跳过逻辑
-      # 如果没有 Python 改动，或者 testmon 发现没有任何测试受影响，直接退出该 Group
       - name: Check if should skip
         id: check_skip
         if: github.event_name == 'pull_request'
@@ -105,13 +123,25 @@ jobs:
           DP_TEST_TF2_ONLY: 1
           DP_DTYPE_PROMOTION_STRICT: 1
 
-      # 保存更新后的 testmon 数据库（关键新增步骤）
+      # ==================== 修改：仅 group 1 负责写缓存，避免并行冲突 ====================
+      # 保存更新后的 testmon 数据库（仅 group 1 执行，防止 24 个 Runner 并行写锁）
       - name: Save testmon DB
-        if: always() && github.event_name == 'pull_request'
+        if: always() && matrix.group == 1
         uses: actions/cache/save@v5
         with:
           path: .testmondata
           key: testmon-${{ matrix.python }}-${{ github.sha }}
+
+      # 新增：main 分支全量跑完后，上传 Seed 包供所有 PR 下载
+      - name: Upload testmon DB as seed artifact
+        if: github.ref == 'refs/heads/main' && matrix.group == 1
+        uses: actions/upload-artifact@v7
+        with:
+          name: testmon-db-${{ matrix.python }}
+          path: .testmondata
+          retention-days: 90  # 保留 90 天，main 每次推送会覆盖更新
+          overwrite: true  # 覆盖旧版本 Seed 包，保证数据最新
+      # ================================================================================
 
       # 后续步骤保持不变
       - run: mv .test_durations .test_durations_${{ matrix.group }}
@@ -126,8 +156,6 @@ jobs:
         continue-on-error: true
         with:
           use_oidc: true
-    permissions:
-      id-token: write
 
   update_durations:
     name: Combine and update integration test durations
