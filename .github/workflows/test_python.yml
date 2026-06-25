@@ -24,9 +24,10 @@ jobs:
         group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         python: ["3.10", "3.13"]
 
-    # 新增：允许下载其他 workflow 的 artifact（用于跨 PR 共享 testmon DB）
+    # ✅ 关键权限：允许下载其他 workflow 的 artifact
     permissions:
       id-token: write
+      contents: read
       actions: read
 
     steps:
@@ -41,6 +42,7 @@ jobs:
 
       # 安装依赖（包含 testmon）
       - run: python -m pip install -U uv
+
       - run: |
           source/install/uv_with_retry.sh pip install --system openmpi --group pin_tensorflow_cpu --group pin_pytorch_cpu --torch-backend cpu
           export TENSORFLOW_ROOT=$(python -c 'import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec("tensorflow").origin).parent)')
@@ -57,20 +59,20 @@ jobs:
           HOROVOD_WITH_MPI: 1
           CMAKE_POLICY_VERSION_MINIMUM: 3.5
 
-      # ==================== 新增：跨 PR 共享 Seed 数据库 ====================
+      # ==================== 跨 PR 共享 Seed 数据库 ====================
       # PR 运行时优先从 main 分支下载全量生成的 .testmondata
       - name: Download seed testmon DB from main branch
         if: github.event_name == 'pull_request'
         uses: dawidd6/action-download-artifact@v3
         with:
-          workflow: test_python.yml  # 当前 workflow 名称
+          workflow: test_python.yml
           branch: test/testmon #main
-          name: testmon-db-${{ matrix.python }}  # 按 Python 版本区分数据库
-          path: .  # 直接下载到仓库根目录
+          name: testmon-db-${{ matrix.python }}
+          path: .
           search_artifacts: true
-          if_no_artifact_found: warn  # 没找到 Seed 包只警告，不中断流程
-        continue-on-error: true  # 下载失败自动回退到 Cache 机制
-      # ======================================================================
+          if_no_artifact_found: warn
+        continue-on-error: true
+      # ===============================================================
 
       # 恢复 Testmon 数据库（兜底逻辑：Seed 下载失败时用）
       - name: Restore testmon DB
@@ -97,8 +99,10 @@ jobs:
         run: |
           echo "skip_all=${{ steps.affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
 
+      # 【优化点 3】增加超时时间，防止测试跑太久被 Runner 杀掉
       - name: Run tests via pytest
         if: steps.check_skip.outputs.skip_all != 'true'
+        timeout-minutes: 60
         run: |
           pytest --testmon --cov=deepmd source/tests \
             --splits 12 --group ${{ matrix.group }} \
@@ -114,19 +118,21 @@ jobs:
         if: steps.check_skip.outputs.skip_all == 'true'
         run: echo "✅ No changes and no prior failures. All tests skipped."
 
-      # TF2 Eager 测试（保持不变，仅在 group 1 运行）
+      # TF2 Eager 测试
       - name: Test TF2 eager mode
         if: matrix.group == 1 && steps.check_skip.outputs.skip_all != 'true'
+        timeout-minutes: 20
         run: pytest --cov=deepmd --cov-append source/tests/consistent/io/test_io.py source/jax2tf_tests
         env:
           NUM_WORKERS: 0
           DP_TEST_TF2_ONLY: 1
           DP_DTYPE_PROMOTION_STRICT: 1
 
-      # ==================== 修改：仅 group 1 负责写缓存，避免并行冲突 ====================
+      # ==================== 保存数据库（仅 group 1 执行，避免并行冲突）====================
       # 保存更新后的 testmon 数据库（仅 group 1 执行，防止 24 个 Runner 并行写锁）
       - name: Save testmon DB
         if: always() && matrix.group == 1
+        continue-on-error: true
         uses: actions/cache/save@v5
         with:
           path: .testmondata
@@ -134,23 +140,24 @@ jobs:
 
       # 新增：main 分支全量跑完后，上传 Seed 包供所有 PR 下载
       - name: Upload testmon DB as seed artifact
-        if: github.ref == 'refs/heads/main' && matrix.group == 1
+        if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1
         uses: actions/upload-artifact@v7
         with:
           name: testmon-db-${{ matrix.python }}
           path: .testmondata
           retention-days: 90  # 保留 90 天，main 每次推送会覆盖更新
           overwrite: true  # 覆盖旧版本 Seed 包，保证数据最新
-      # ================================================================================
+      # ======================================================================================
 
-      # 后续步骤保持不变
       - run: mv .test_durations .test_durations_${{ matrix.group }}
+
       - name: Upload partial durations
         uses: actions/upload-artifact@v7
         with:
           name: split-${{ matrix.python }}-${{ matrix.group }}
           path: .test_durations_${{ matrix.group }}
           include-hidden-files: true
+
       - name: Upload coverage to Codecov (non-blocking)
         uses: codecov/codecov-action@v7
         continue-on-error: true
@@ -172,11 +179,13 @@ jobs:
           path: .test_durations
           key: test2-durations-combined-${{ matrix.python }}-${{ github.sha }}
           restore-keys: test2-durations-combined-${{ matrix.python }}
+
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
           pattern: split-${{ matrix.python }}-*
           merge-multiple: true
+
       - name: Combine test durations
         run: jq -s add .test_durations_* > .test_durations
 
