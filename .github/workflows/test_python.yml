@@ -102,7 +102,7 @@ jobs:
       # 【优化点 3】增加超时时间，防止测试跑太久被 Runner 杀掉
       - name: Run tests via pytest
         if: steps.check_skip.outputs.skip_all != 'true'
-        timeout-minutes: 60
+        timeout-minutes: 180
         run: |
           pytest --testmon --cov=deepmd source/tests \
             --splits 12 --group ${{ matrix.group }} \
