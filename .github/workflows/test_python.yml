@@ -78,9 +78,11 @@ jobs:
       - name: Restore testmon DB
         uses: actions/cache@v5
         with:
-          path: .testmondata
-          key: testmon-${{ matrix.python }}-${{ github.sha }}
+          path: .testmondata  # 修正1：改为两个点
+          # 修正2：Key 固定为分支名，不使用动态 sha
+          key: testmon-${{ matrix.python }}-test/testmon 
           restore-keys: |
+            testmon-${{ matrix.python }}-test/testmon
             testmon-${{ matrix.python }}-
 
       # 探测受影响的测试文件（仅 PR 事件运行）
@@ -136,11 +138,11 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: .testmondata
-          key: testmon-${{ matrix.python }}-${{ github.sha }}
-
+          key: testmon-${{ matrix.python }}-test/testmon
+           
       # 新增：main 分支全量跑完后，上传 Seed 包供所有 PR 下载
       - name: Upload testmon DB as seed artifact
-        if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1
+        if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1  && always()
         uses: actions/upload-artifact@v7
         with:
           name: testmon-db-${{ matrix.python }}
