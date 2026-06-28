@@ -24,14 +24,12 @@ jobs:
         group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         python: ["3.10", "3.13"]
 
-    # ✅ 关键权限：允许下载其他 workflow 的 artifact
     permissions:
       id-token: write
       contents: read
       actions: read
 
     steps:
-      # 关键：必须 fetch-depth: 0，否则 git diff 在 PR 中无法获取 base commit
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -40,7 +38,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # 安装依赖（包含 testmon）
+      # 安装依赖
       - run: python -m pip install -U uv
 
       - run: |
@@ -49,7 +47,6 @@ jobs:
           export PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')
           source/install/uv_with_retry.sh pip install --system -e .[test,jax,torch] mpi4py --group pin_jax_cpu
           source/install/uv_with_retry.sh pip install --system --find-links "https://www.paddlepaddle.org.cn/packages/nightly/cpu/paddlepaddle/" --index-url https://pypi.org/simple --trusted-host www.paddlepaddle.org.cn --trusted-host paddlepaddle.org.cn paddlepaddle==3.4.0.dev20260310
-          # 安装 testmon
           python -m pip install pytest-testmon array-api-strict
         env:
           DP_ENABLE_PYTORCH: 1
@@ -60,13 +57,13 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: 3.5
 
       # ==================== 跨 PR 共享 Seed 数据库 ====================
-      # PR 运行时优先从 main 分支下载全量生成的 .testmondata
-      - name: Download seed testmon DB from main branch
+      # 从 test/testmon 分支下载 Seed
+      - name: Download seed testmon DB from test/testmon branch
         if: github.event_name == 'pull_request'
         uses: dawidd6/action-download-artifact@v3
         with:
           workflow: test_python.yml
-          branch: test/testmon #main
+          branch: test/testmon
           name: testmon-db-${{ matrix.python }}
           path: .
           search_artifacts: true
@@ -74,18 +71,16 @@ jobs:
         continue-on-error: true
       # ===============================================================
 
-      # 恢复 Testmon 数据库（兜底逻辑：Seed 下载失败时用）
+      # 恢复缓存（兜底）
       - name: Restore testmon DB
         uses: actions/cache@v5
         with:
-          path: .testmondata  # 修正1：改为两个点
-          # 修正2：Key 固定为分支名，不使用动态 sha
-          key: testmon-${{ matrix.python }}-test/testmon 
+          path: .testmondata
+          key: testmon-${{ matrix.python }}-test/testmon
           restore-keys: |
-            testmon-${{ matrix.python }}-test/testmon
             testmon-${{ matrix.python }}-
 
-      # 探测受影响的测试文件（仅 PR 事件运行）
+      # 探测受影响文件
       - name: Detect affected tests (PR only)
         if: github.event_name == 'pull_request'
         id: affected
@@ -94,14 +89,13 @@ jobs:
           GITHUB_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           GITHUB_PR_HEAD_SHA: ${{ github.sha }}
 
-      # 智能跳过逻辑
       - name: Check if should skip
         id: check_skip
         if: github.event_name == 'pull_request'
         run: |
           echo "skip_all=${{ steps.affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
 
-      # 【优化点 3】增加超时时间，防止测试跑太久被 Runner 杀掉
+      # 运行测试
       - name: Run tests via pytest
         if: steps.check_skip.outputs.skip_all != 'true'
         timeout-minutes: 180
@@ -130,26 +124,31 @@ jobs:
           DP_TEST_TF2_ONLY: 1
           DP_DTYPE_PROMOTION_STRICT: 1
 
-      # ==================== 保存数据库（仅 group 1 执行，避免并行冲突）====================
-      # 保存更新后的 testmon 数据库（仅 group 1 执行，防止 24 个 Runner 并行写锁）
-      - name: Save testmon DB
-        if: always() && matrix.group == 1
-        continue-on-error: true
-        uses: actions/cache/save@v5
-        with:
-          path: .testmondata
-          key: testmon-${{ matrix.python }}-test/testmon
-           
-      # 新增：main 分支全量跑完后，上传 Seed 包供所有 PR 下载
+      # ==================== 保存 Seed（修复并发冲突）====================
+      # 仅 test/testmon 分支的 Group 1 执行
+      - name: Generate testmon seed (Group 1 only)
+        if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1
+        run: |
+          echo "Generating testmon seed..."
+          # 确保 .testmondata 存在
+          if [ -f .testmondata ]; then
+            echo "✅ .testmondata exists"
+            ls -la .testmondata
+          else
+            echo "❌ .testmondata NOT found"
+            exit 1
+          fi
+
+      # 上传 Seed Artifact（修复路径和权限）
       - name: Upload testmon DB as seed artifact
-        if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1  && always()
+        if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1 && always()
         uses: actions/upload-artifact@v7
         with:
           name: testmon-db-${{ matrix.python }}
           path: .testmondata
-          retention-days: 90  # 保留 90 天，main 每次推送会覆盖更新
-          overwrite: true  # 覆盖旧版本 Seed 包，保证数据最新
-      # ======================================================================================
+          retention-days: 90
+          overwrite: true
+      # =================================================================
 
       - run: mv .test_durations .test_durations_${{ matrix.group }}
 
