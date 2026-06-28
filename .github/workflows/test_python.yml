@@ -145,7 +145,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: testmon-db-${{ matrix.python }}
-          path: .testmondata
+          path: testmondata
           retention-days: 90
           overwrite: true
       # =================================================================
