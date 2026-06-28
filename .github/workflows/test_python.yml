@@ -123,15 +123,48 @@ jobs:
           DP_TEST_TF2_ONLY: 1
           DP_DTYPE_PROMOTION_STRICT: 1
 
-      # ==================== 保存 Seed（终极修复：直接上传文件）====================
+      # ==================== 保存 Seed（使用动态路径查找，修复上传失败）====================
       # 仅 test/testmon 分支的 Group 1 执行
+      - name: Package testmon seed (Group 1 only)
+        if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1
+        run: |
+          echo "=== Packaging testmon seed ==="
+          echo "Current directory: $(pwd)"
+          
+          # 使用 find 命令精确查找 .testmondata 文件
+          TESTMON_FILE=$(find . -name ".testmondata" -print -quit)
+          
+          if [ -z "$TESTMON_FILE" ]; then
+            echo "❌ .testmondata file not found in the current directory or subdirectories!"
+            echo "Listing all files recursively (max depth 3):"
+            find . -maxdepth 3 -type f | sort
+            exit 1
+          fi
+
+          echo "✅ Found .testmondata at: $TESTMON_FILE"
+          echo "File details:"
+          ls -l "$TESTMON_FILE"
+
+          # 创建专用的上传目录
+          UPLOAD_DIR="testmon-upload"
+          mkdir -p "$UPLOAD_DIR"
+
+          # 复制文件到上传目录（保留原始文件名）
+          echo "Copying $TESTMON_FILE to $UPLOAD_DIR/..."
+          cp "$TESTMON_FILE" "$UPLOAD_DIR/"
+
+          echo "Files prepared for upload:"
+          ls -la "$UPLOAD_DIR/"
+        shell: bash
+
+      # 上传 Seed Artifact（使用动态路径）
       - name: Upload testmon DB as seed artifact
         if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1 && always()
         uses: actions/upload-artifact@v7
         with:
           name: testmon-db-${{ matrix.python }}
-          # 关键修复：使用绝对路径直接上传文件，避免目录解析问题
-          path: ${{ github.workspace }}/.testmondata
+          # 使用 find 命令再次确认要上传的文件路径
+          path: $(find testmon-upload -name ".testmondata")
           retention-days: 90
           overwrite: true
       # =================================================================
