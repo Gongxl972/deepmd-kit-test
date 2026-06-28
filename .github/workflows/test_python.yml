@@ -123,44 +123,15 @@ jobs:
           DP_TEST_TF2_ONLY: 1
           DP_DTYPE_PROMOTION_STRICT: 1
 
-      # ==================== 保存 Seed（完全修复）====================
+      # ==================== 保存 Seed（终极修复：直接上传文件）====================
       # 仅 test/testmon 分支的 Group 1 执行
-      - name: Package testmon seed (Group 1 only)
-        if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1
-        run: |
-          echo "Packaging testmon seed..."
-          echo "Current directory: $(pwd)"
-          echo "Listing all files:"
-          ls -la
-          
-          # 确保 .testmondata 存在
-          if [ -f .testmondata ]; then
-            echo "✅ .testmondata exists"
-            ls -l .testmondata
-            
-            # 创建上传目录
-            mkdir -p testmon-upload
-            
-            # 关键修复：.testmondata 是文件，不是目录，不要用 -r 参数
-            cp .testmondata testmon-upload/
-            
-            echo "Files prepared for upload:"
-            ls -la testmon-upload/
-          else
-            echo "❌ .testmondata NOT found"
-            echo "Listing .test* files:"
-            ls -la .test* || true
-            exit 1
-          fi
-
-      # 上传 Seed Artifact（使用绝对路径）
       - name: Upload testmon DB as seed artifact
         if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1 && always()
         uses: actions/upload-artifact@v7
         with:
           name: testmon-db-${{ matrix.python }}
-          # 使用绝对路径确保文件存在
-          path: ${{ github.workspace }}/testmon-upload/.testmondata
+          # 关键修复：使用绝对路径直接上传文件，避免目录解析问题
+          path: ${{ github.workspace }}/.testmondata
           retention-days: 90
           overwrite: true
       # =================================================================
