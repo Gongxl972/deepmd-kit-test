@@ -65,11 +65,10 @@ jobs:
           workflow: test_python.yml
           branch: test/testmon
           name: testmon-db-${{ matrix.python }}
-          path: .
+          path: .  # 下载到当前目录
           search_artifacts: true
           if_no_artifact_found: warn
         continue-on-error: true
-      # ===============================================================
 
       # 恢复缓存（兜底）
       - name: Restore testmon DB
@@ -124,28 +123,37 @@ jobs:
           DP_TEST_TF2_ONLY: 1
           DP_DTYPE_PROMOTION_STRICT: 1
 
-      # ==================== 保存 Seed（修复并发冲突）====================
+      # ==================== 保存 Seed（修复上传路径）====================
       # 仅 test/testmon 分支的 Group 1 执行
-      - name: Generate testmon seed (Group 1 only)
+      - name: Package testmon seed (Group 1 only)
         if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1
         run: |
-          echo "Generating testmon seed..."
+          echo "Packaging testmon seed..."
           # 确保 .testmondata 存在
           if [ -f .testmondata ]; then
             echo "✅ .testmondata exists"
             ls -la .testmondata
+            
+            # 创建上传目录
+            mkdir -p testmon-upload
+            
+            # 复制文件到上传目录（关键修复：复制而不是移动）
+            cp -r .testmondata testmon-upload/
+            
+            echo "Files prepared for upload:"
+            ls -la testmon-upload/
           else
             echo "❌ .testmondata NOT found"
             exit 1
           fi
 
-      # 上传 Seed Artifact（修复路径和权限）
+      # 上传 Seed Artifact（修复路径）
       - name: Upload testmon DB as seed artifact
         if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1 && always()
         uses: actions/upload-artifact@v7
         with:
           name: testmon-db-${{ matrix.python }}
-          path: testmondata
+          path: testmon-upload  # 上传整个目录
           retention-days: 90
           overwrite: true
       # =================================================================
