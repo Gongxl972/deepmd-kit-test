@@ -123,10 +123,9 @@ jobs:
           DP_TEST_TF2_ONLY: 1
           DP_DTYPE_PROMOTION_STRICT: 1
 
-      # ==================== 保存 Seed（使用动态路径查找，修复上传失败）====================
+      # ==================== 保存 Seed（最简路径策略）====================
       # 仅 test/testmon 分支的 Group 1 执行
       - name: Package testmon seed (Group 1 only)
-        id: package_step  # 添加 ID 以便在后续步骤中引用
         if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1
         run: |
           echo "=== Packaging testmon seed ==="
@@ -146,29 +145,22 @@ jobs:
           echo "File details:"
           ls -l "$TESTMON_FILE"
 
-          # 创建专用的上传目录
-          UPLOAD_DIR="testmon-upload"
-          mkdir -p "$UPLOAD_DIR"
-
-          # 复制文件到上传目录（保留原始文件名）
-          echo "Copying $TESTMON_FILE to $UPLOAD_DIR/..."
-          cp "$TESTMON_FILE" "$UPLOAD_DIR/"
-
-          echo "Files prepared for upload:"
-          ls -la "$UPLOAD_DIR/"
+          # 关键修复：直接复制到工作区根目录，使用非隐藏文件名
+          echo "Copying to workspace root as testmon-seed.data..."
+          cp "$TESTMON_FILE" ./testmon-seed.data
           
-          # 关键修复：将文件路径设置为输出变量
-          echo "testmon_path=$UPLOAD_DIR/.testmondata" >> $GITHUB_OUTPUT
+          echo "Files prepared for upload:"
+          ls -la ./testmon-seed.data
         shell: bash
 
-      # 上传 Seed Artifact（使用输出变量）
+      # 上传 Seed Artifact（直接上传根目录下的文件）
       - name: Upload testmon DB as seed artifact
         if: github.ref == 'refs/heads/test/testmon' && matrix.group == 1 && always()
         uses: actions/upload-artifact@v7
         with:
           name: testmon-db-${{ matrix.python }}
-          # 使用步骤输出变量中的路径
-          path: ${{ steps.package_step.outputs.testmon_path }}
+          # 直接写文件名，GitHub Actions 默认在工作区根部查找
+          path: testmon-seed.data
           retention-days: 90
           overwrite: true
       # =================================================================
