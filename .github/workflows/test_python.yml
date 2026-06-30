@@ -70,6 +70,21 @@ jobs:
           if_no_artifact_found: warn
         continue-on-error: true
 
+      # 新增：验证下载的 Seed 文件
+      - name: Verify testmon seed file exists
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "Checking for .testmondata file..."
+          if [ -f .testmondata ]; then
+            echo "✅ .testmondata file found"
+            ls -la .testmondata
+            echo "File size: $(du -h .testmondata | cut -f1)"
+          else
+            echo "⚠️ .testmondata file NOT found after download"
+            echo "Listing current directory contents:"
+            ls -la
+          fi
+
       # 恢复缓存（兜底）
       - name: Restore testmon DB
         uses: actions/cache@v5
@@ -94,12 +109,13 @@ jobs:
         run: |
           echo "skip_all=${{ steps.affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
 
-      # 运行测试
+      # 运行测试（添加 -vv 参数）
       - name: Run tests via pytest
         if: steps.check_skip.outputs.skip_all != 'true'
         timeout-minutes: 180
         run: |
-          pytest --testmon --cov=deepmd source/tests \
+          echo "Starting pytest with testmon and verbose output..."
+          pytest -vv --testmon --cov=deepmd source/tests \
             --splits 12 --group ${{ matrix.group }} \
             --store-durations --clean-durations \
             --durations-path=.test_durations \
