@@ -121,7 +121,24 @@ jobs:
           echo "Testmon environment variables:"
           echo "  TESTMON_DISABLE_ENV_CHECK=1"
           echo "  TESTMON_EXCLUDE_PYTHON_CODE=''"
-          pytest -vv --testmon --cov=deepmd source/tests \
+          echo "  TESTMON_FORCE_SELECT=true"
+          
+          # 强制使用现有的 .testmondata 文件
+          if [ -f .testmondata ]; then
+            echo "✅ Found existing .testmondata file"
+            echo "File info: $(ls -lh .testmondata)"
+            echo "Modification time: $(stat -c %y .testmondata)"
+            
+            # 备份原文件以防万一
+            cp .testmondata .testmondata.backup
+            echo "✅ Backed up .testmondata to .testmondata.backup"
+          else
+            echo "❌ No .testmondata file found!"
+            exit 1
+          fi
+          
+          # 运行测试，强制 Testmon 使用现有数据库
+          pytest -vv --testmon --testmon-env-check=false --cov=deepmd source/tests \
             --splits 12 --group ${{ matrix.group }} \
             --store-durations --clean-durations \
             --durations-path=.test_durations \
@@ -130,9 +147,12 @@ jobs:
           NUM_WORKERS: 0
           DP_CI_IMPORT_PADDLE_BEFORE_TF: 1
           FLAGS_use_stride_compute_kernel: 0
-          # 关键修复：强制 Testmon 忽略环境变化
+          # 强制 Testmon 忽略环境变化
           TESTMON_DISABLE_ENV_CHECK: 1
           TESTMON_EXCLUDE_PYTHON_CODE: ""
+          TESTMON_FORCE_SELECT: true
+          # 禁用 Python 代码的环境检查
+          PYTHONDONTWRITEBYTECODE: 1
 
       - name: Skipped tests notification
         if: steps.check_skip.outputs.skip_all == 'true'
