@@ -112,7 +112,7 @@ jobs:
         run: |
           echo "skip_all=${{ steps.affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
 
-      # 运行测试（添加 -vv 参数和 Testmon 环境变量）
+      # 运行测试（移除无效参数，仅保留环境变量）
       - name: Run tests via pytest
         if: steps.check_skip.outputs.skip_all != 'true'
         timeout-minutes: 180
@@ -121,7 +121,7 @@ jobs:
           echo "Testmon environment variables:"
           echo "  TESTMON_DISABLE_ENV_CHECK=1"
           echo "  TESTMON_EXCLUDE_PYTHON_CODE=''"
-          echo "  TESTMON_FORCE_SELECT=true"
+          echo "  TESTMON_FORCE_SELECT=1"
           
           # 强制使用现有的 .testmondata 文件
           if [ -f .testmondata ]; then
@@ -137,8 +137,8 @@ jobs:
             exit 1
           fi
           
-          # 运行测试，强制 Testmon 使用现有数据库
-          pytest -vv --testmon --testmon-env-check=false --cov=deepmd source/tests \
+          # 运行测试，仅使用环境变量控制 testmon
+          pytest -vv --testmon --cov=deepmd source/tests \
             --splits 12 --group ${{ matrix.group }} \
             --store-durations --clean-durations \
             --durations-path=.test_durations \
@@ -150,7 +150,7 @@ jobs:
           # 强制 Testmon 忽略环境变化
           TESTMON_DISABLE_ENV_CHECK: 1
           TESTMON_EXCLUDE_PYTHON_CODE: ""
-          TESTMON_FORCE_SELECT: true
+          TESTMON_FORCE_SELECT: 1
           # 禁用 Python 代码的环境检查
           PYTHONDONTWRITEBYTECODE: 1
 
