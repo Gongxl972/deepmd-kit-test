@@ -47,8 +47,7 @@ jobs:
           export PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')
           source/install/uv_with_retry.sh pip install --system -e .[test,jax,torch] mpi4py --group pin_jax_cpu
           source/install/uv_with_retry.sh pip install --system --find-links "https://www.paddlepaddle.org.cn/packages/nightly/cpu/paddlepaddle/" --index-url https://pypi.org/simple --trusted-host www.paddlepaddle.org.cn --trusted-host paddlepaddle.org.cn paddlepaddle==3.4.0.dev20260310
-          # 移除了 pytest-testmon，改用原生 pytest
-          python -m pip install array-api-strict
+          python -m pip install array-api-strict pytest-split
         env:
           DP_ENABLE_PYTORCH: 1
           DP_BUILD_TESTING: 1
@@ -56,6 +55,15 @@ jobs:
           HOROVOD_WITHOUT_PYTORCH: 1
           HOROVOD_WITH_MPI: 1
           CMAKE_POLICY_VERSION_MINIMUM: 3.5
+
+      # ==================== 恢复失败测试缓存 ====================
+      - name: Restore failed tests cache
+        uses: actions/cache@v5
+        with:
+          path: .failed_tests_${{ matrix.python }}_${{ matrix.group }}
+          key: failed-tests-${{ matrix.python }}-${{ matrix.group }}-${{ github.run_id }}
+          restore-keys: |
+            failed-tests-${{ matrix.python }}-${{ matrix.group }}-
 
       # ==================== 基于 Git Diff 的精准测试选择 ====================
       - name: Detect affected tests
@@ -88,72 +96,83 @@ jobs:
           
           if [ -z "$CHANGED_FILES" ]; then
             echo "No files changed."
-            echo "skip_all=true" >> $GITHUB_OUTPUT
-            echo "selected_paths=source/tests/" >> $GITHUB_OUTPUT
-            exit 0
+            # 即使没有文件变更，也可能有失败的测试需要重跑
+            SELECTED_PATHS=""
+          else
+            echo "Changed files:"
+            echo "$CHANGED_FILES"
+            
+            # 初始化测试路径列表
+            TEST_PATHS=""
+            
+            # 定义映射规则：源码目录 -> 测试目录
+            # 注意：根据你的项目实际结构调整这些映射关系
+            while IFS= read -r file; do
+              if [[ -z "$file" ]]; then
+                continue
+              fi
+              
+              echo "Processing file: $file"
+              
+              # 如果是测试文件本身被修改
+              if [[ "$file" == source/tests/* ]]; then
+                if [[ -f "$file" ]]; then
+                  TEST_PATHS="$TEST_PATHS $file"
+                  echo "  Added test file: $file"
+                fi
+              # 如果是源代码文件
+              elif [[ "$file" == source/deepmd/* ]] && [[ "$file" == *.py ]]; then
+                # 提取模块路径
+                MODULE_PATH=${file#source/deepmd/}
+                MODULE_NAME=${MODULE_PATH%.py}
+                
+                # 构造可能的测试路径
+                # 尝试多种可能的测试路径模式
+                POSSIBLE_TESTS=(
+                  "source/tests/test_${MODULE_NAME}.py"
+                  "source/tests/${MODULE_NAME}/test_$(basename ${MODULE_PATH})"
+                  "source/tests/$(dirname ${MODULE_NAME})/test_$(basename ${MODULE_PATH})"
+                  "source/tests/integration/test_${MODULE_NAME}.py"
+                  "source/tests/consistent/test_${MODULE_NAME}.py"
+                )
+                
+                for test_path in "${POSSIBLE_TESTS[@]}"; do
+                  if [[ -f "$test_path" ]]; then
+                    TEST_PATHS="$TEST_PATHS $test_path"
+                    echo "  Mapped to test: $test_path"
+                    break
+                  fi
+                done
+              fi
+            done <<< "$CHANGED_FILES"
+            
+            SELECTED_PATHS="$TEST_PATHS"
           fi
           
-          echo "Changed files:"
-          echo "$CHANGED_FILES"
-          
-          # 初始化测试路径列表
-          TEST_PATHS=""
-          
-          # 定义映射规则：源码目录 -> 测试目录
-          # 注意：根据你的项目实际结构调整这些映射关系
-          while IFS= read -r file; do
-            if [[ -z "$file" ]]; then
-              continue
-            fi
-            
-            echo "Processing file: $file"
-            
-            # 如果是测试文件本身被修改
-            if [[ "$file" == source/tests/* ]]; then
-              if [[ -f "$file" ]]; then
-                TEST_PATHS="$TEST_PATHS $file"
-                echo "  Added test file: $file"
-              fi
-            # 如果是源代码文件
-            elif [[ "$file" == source/deepmd/* ]] && [[ "$file" == *.py ]]; then
-              # 提取模块路径
-              MODULE_PATH=${file#source/deepmd/}
-              MODULE_NAME=${MODULE_PATH%.py}
-              
-              # 构造可能的测试路径
-              # 尝试多种可能的测试路径模式
-              POSSIBLE_TESTS=(
-                "source/tests/test_${MODULE_NAME}.py"
-                "source/tests/${MODULE_NAME}/test_$(basename ${MODULE_PATH})"
-                "source/tests/$(dirname ${MODULE_NAME})/test_$(basename ${MODULE_PATH})"
-                "source/tests/integration/test_${MODULE_NAME}.py"
-                "source/tests/consistent/test_${MODULE_NAME}.py"
-              )
-              
-              for test_path in "${POSSIBLE_TESTS[@]}"; do
-                if [[ -f "$test_path" ]]; then
-                  TEST_PATHS="$TEST_PATHS $test_path"
-                  echo "  Mapped to test: $test_path"
-                  break
-                fi
-              done
-            fi
-          done <<< "$CHANGED_FILES"
+          # 检查是否有缓存的失败测试需要重跑
+          FAILED_TESTS_FILE=".failed_tests_${{ matrix.python }}_${{ matrix.group }}"
+          if [ -f "$FAILED_TESTS_FILE" ]; then
+            echo "Found cached failed tests:"
+            cat "$FAILED_TESTS_FILE"
+            # 将失败测试添加到选中路径中
+            SELECTED_PATHS="$SELECTED_PATHS $(cat $FAILED_TESTS_FILE)"
+            echo "Added failed tests to run list"
+          fi
           
           # 如果没有找到任何测试路径，运行所有测试（安全兜底）
-          if [[ -z "$TEST_PATHS" ]]; then
+          if [[ -z "$SELECTED_PATHS" ]]; then
             echo "No specific tests found, will run all tests"
-            TEST_PATHS="source/tests"
+            SELECTED_PATHS="source/tests"
             SKIP_ALL="false"
           else
             echo "Found specific tests to run:"
-            echo "$TEST_PATHS"
+            echo "$SELECTED_PATHS"
             SKIP_ALL="false"
           fi
           
           # 输出到 GitHub Actions
           echo "skip_all=$SKIP_ALL" >> $GITHUB_OUTPUT
-          echo "selected_paths=$TEST_PATHS" >> $GITHUB_OUTPUT
+          echo "selected_paths=$SELECTED_PATHS" >> $GITHUB_OUTPUT
         shell: bash
 
       - name: Check if should skip
@@ -196,6 +215,31 @@ jobs:
           NUM_WORKERS: 0
           DP_TEST_TF2_ONLY: 1
           DP_DTYPE_PROMOTION_STRICT: 1
+
+      # ==================== 保存失败测试缓存 ====================
+      - name: Save failed tests cache
+        if: always()  # 无论测试成功还是失败，都运行此步骤
+        run: |
+          echo "Saving failed tests cache..."
+          
+          # 创建失败测试文件
+          FAILED_TESTS_FILE=".failed_tests_${{ matrix.python }}_${{ matrix.group }}"
+          
+          # 从 pytest 输出中提取失败的测试
+          # 注意：这里需要根据你的 pytest 输出格式来调整
+          # 通常失败测试会以 FAILED 开头，后面跟着测试路径
+          if grep -q "FAILED" .test_durations; then
+            echo "Extracting failed tests..."
+            # 提取失败的测试路径（假设格式为 "FAILED source/tests/path/to/test.py::TestClass::test_method"）
+            grep "FAILED" .test_durations | sed 's/.*FAILED //' | sed 's/::.*//' | sort -u > "$FAILED_TESTS_FILE"
+            echo "Failed tests saved:"
+            cat "$FAILED_TESTS_FILE"
+          else
+            echo "No failed tests found."
+            # 如果没有失败测试，删除可能存在的旧文件
+            rm -f "$FAILED_TESTS_FILE"
+          fi
+        shell: bash
 
       # 保存测试持续时间数据
       - run: mv .test_durations .test_durations_${{ matrix.group }}
