@@ -69,11 +69,19 @@ jobs:
       - name: Detect affected tests
         id: affected
         run: |
-          echo "Detecting affected tests..."
+          echo "=========================================="
+          echo "🔍 STARTING AFFECTED TESTS DETECTION"
+          echo "=========================================="
+          echo "Event name: ${{ github.event_name }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Ref: ${{ github.ref }}"
+          echo "SHA: ${{ github.sha }}"
+          echo ""
           
           # 根据事件类型确定 Base SHA
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            echo "PR Base SHA: $BASE_SHA"
           elif [[ "${{ github.event_name }}" == "push" ]]; then
             # 处理首次推送（before 是全 0）的情况
             if [[ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]]; then
@@ -81,32 +89,44 @@ jobs:
               BASE_SHA="HEAD~1"
             else
               BASE_SHA="${{ github.event.before }}"
+              echo "Push Before SHA: $BASE_SHA"
             fi
           else
             # Schedule 或其他事件，默认与 main 分支比较
             git fetch origin main
             BASE_SHA="origin/main"
+            echo "Schedule/Other Event Base SHA: $BASE_SHA"
           fi
           
-          echo "Base SHA: $BASE_SHA"
           echo "Head SHA: ${{ github.sha }}"
+          echo ""
           
           # 获取变更的文件列表（排除删除的文件）
+          echo "📁 RUNNING GIT DIFF..."
           CHANGED_FILES=$(git diff --name-only --diff-filter=d $BASE_SHA ${{ github.sha }})
           
           if [ -z "$CHANGED_FILES" ]; then
-            echo "No files changed."
-            # 即使没有文件变更，也可能有失败的测试需要重跑
+            echo "❌ NO FILES CHANGED"
+            echo "This means git diff returned empty"
             SELECTED_PATHS=""
           else
-            echo "Changed files:"
+            echo "✅ CHANGED FILES DETECTED:"
             echo "$CHANGED_FILES"
+            echo ""
             
             # 初始化测试路径列表
             TEST_PATHS=""
             
             # 定义映射规则：源码目录 -> 测试目录
-            # 注意：根据你的项目实际结构调整这些映射关系
+            echo "🗺️ MAPPING RULES:"
+            echo "  Rule 1: source/tests/* → Direct test file"
+            echo "  Rule 2: source/deepmd/*.py → Possible test locations"
+            echo ""
+            
+            # 统计变量
+            MATCHED_FILES=0
+            UNMATCHED_FILES=0
+            
             while IFS= read -r file; do
               if [[ -z "$file" ]]; then
                 continue
@@ -118,7 +138,10 @@ jobs:
               if [[ "$file" == source/tests/* ]]; then
                 if [[ -f "$file" ]]; then
                   TEST_PATHS="$TEST_PATHS $file"
-                  echo "  Added test file: $file"
+                  echo "  ✅ MATCHED: Test file directly added: $file"
+                  MATCHED_FILES=$((MATCHED_FILES + 1))
+                else
+                  echo "  ⚠️ WARNING: Test file listed but not found: $file"
                 fi
               # 如果是源代码文件
               elif [[ "$file" == source/deepmd/* ]] && [[ "$file" == *.py ]]; then
@@ -126,8 +149,9 @@ jobs:
                 MODULE_PATH=${file#source/deepmd/}
                 MODULE_NAME=${MODULE_PATH%.py}
                 
+                echo "  🔍 Looking for tests for module: $MODULE_NAME"
+                
                 # 构造可能的测试路径
-                # 尝试多种可能的测试路径模式
                 POSSIBLE_TESTS=(
                   "source/tests/test_${MODULE_NAME}.py"
                   "source/tests/${MODULE_NAME}/test_$(basename ${MODULE_PATH})"
@@ -136,15 +160,35 @@ jobs:
                   "source/tests/consistent/test_${MODULE_NAME}.py"
                 )
                 
+                FOUND_TEST=false
                 for test_path in "${POSSIBLE_TESTS[@]}"; do
                   if [[ -f "$test_path" ]]; then
                     TEST_PATHS="$TEST_PATHS $test_path"
-                    echo "  Mapped to test: $test_path"
+                    echo "  ✅ MATCHED: Mapped $file → $test_path"
+                    FOUND_TEST=true
+                    MATCHED_FILES=$((MATCHED_FILES + 1))
                     break
                   fi
                 done
+                
+                if [[ "$FOUND_TEST" == "false" ]]; then
+                  echo "  ❌ NO MATCH: Could not find test for $file"
+                  echo "    Tried: ${POSSIBLE_TESTS[@]}"
+                  UNMATCHED_FILES=$((UNMATCHED_FILES + 1))
+                fi
+              else
+                echo "  ⚠️ UNKNOWN FILE TYPE: $file"
+                echo "    Does not match source/tests/* or source/deepmd/*.py"
+                UNMATCHED_FILES=$((UNMATCHED_FILES + 1))
               fi
             done <<< "$CHANGED_FILES"
+            
+            echo ""
+            echo "📊 MAPPING SUMMARY:"
+            echo "  Total changed files: $(echo "$CHANGED_FILES" | wc -l)"
+            echo "  Matched to tests: $MATCHED_FILES"
+            echo "  Unmatched: $UNMATCHED_FILES"
+            echo ""
             
             SELECTED_PATHS="$TEST_PATHS"
           fi
@@ -152,32 +196,49 @@ jobs:
           # 检查是否有缓存的失败测试需要重跑
           FAILED_TESTS_FILE=".failed_tests_${{ matrix.python }}_${{ matrix.group }}"
           if [ -f "$FAILED_TESTS_FILE" ]; then
-            echo "Found cached failed tests:"
+            echo "💾 FOUND CACHED FAILED TESTS:"
             cat "$FAILED_TESTS_FILE"
+            echo ""
             # 将失败测试添加到选中路径中
             SELECTED_PATHS="$SELECTED_PATHS $(cat $FAILED_TESTS_FILE)"
             echo "Added failed tests to run list"
+          else
+            echo "💾 NO CACHED FAILED TESTS FOUND"
           fi
           
           # 如果没有找到任何测试路径，运行所有测试（安全兜底）
           if [[ -z "$SELECTED_PATHS" ]]; then
-            echo "No specific tests found, will run all tests"
+            echo "🚨 TRIGGERING FULL TEST SUITE (NO SPECIFIC TESTS FOUND)"
+            echo "Reasons why this might happen:"
+            echo "  1. No files changed"
+            echo "  2. Changed files don't match any mapping rules"
+            echo "  3. All mapped tests were filtered out"
+            echo ""
             SELECTED_PATHS="source/tests"
             SKIP_ALL="false"
           else
-            echo "Found specific tests to run:"
+            echo "🎯 SPECIFIC TESTS SELECTED:"
             echo "$SELECTED_PATHS"
+            echo ""
+            echo "Number of test paths: $(echo "$SELECTED_PATHS" | wc -w)"
             SKIP_ALL="false"
           fi
           
           # 输出到 GitHub Actions
           echo "skip_all=$SKIP_ALL" >> $GITHUB_OUTPUT
           echo "selected_paths=$SELECTED_PATHS" >> $GITHUB_OUTPUT
+          
+          echo "=========================================="
+          echo "✅ FINISHED AFFECTED TESTS DETECTION"
+          echo "=========================================="
         shell: bash
 
       - name: Check if should skip
         id: check_skip
         run: |
+          echo "Check if should skip:"
+          echo "skip_all=${{ steps.affected.outputs.skip_all }}"
+          echo "selected_paths=${{ steps.affected.outputs.selected_paths }}"
           echo "skip_all=${{ steps.affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
 
       # 运行测试（基于选中的路径）
@@ -185,13 +246,30 @@ jobs:
         if: steps.check_skip.outputs.skip_all != 'true'
         timeout-minutes: 180
         run: |
-          echo "Starting pytest with incremental selection..."
+          echo "🚀 STARTING PYTEST WITH INCREMENTAL SELECTION"
+          echo "============================================="
           
           # 获取选定的测试路径
           SELECTED_PATHS="${{ steps.affected.outputs.selected_paths }}"
-          echo "Running tests for paths: $SELECTED_PATHS"
+          echo "Selected test paths: $SELECTED_PATHS"
+          echo ""
+          
+          # 统计测试路径数量
+          PATH_COUNT=$(echo "$SELECTED_PATHS" | wc -w)
+          echo "Number of test paths: $PATH_COUNT"
+          echo ""
+          
+          # 如果是全量测试，给出警告
+          if [[ "$SELECTED_PATHS" == "source/tests" ]]; then
+            echo "⚠️ WARNING: Running FULL TEST SUITE"
+            echo "This will take a long time!"
+          else
+            echo "✅ Running incremental tests only"
+          fi
+          echo ""
           
           # 运行选定的测试
+          echo "Running pytest command..."
           pytest -vv --cov=deepmd $SELECTED_PATHS \
             --splits 12 --group ${{ matrix.group }} \
             --store-durations --clean-durations \
@@ -220,7 +298,8 @@ jobs:
       - name: Save failed tests cache
         if: always()  # 无论测试成功还是失败，都运行此步骤
         run: |
-          echo "Saving failed tests cache..."
+          echo "💾 SAVING FAILED TESTS CACHE"
+          echo "============================="
           
           # 创建失败测试文件
           FAILED_TESTS_FILE=".failed_tests_${{ matrix.python }}_${{ matrix.group }}"
@@ -229,13 +308,14 @@ jobs:
           # 注意：这里需要根据你的 pytest 输出格式来调整
           # 通常失败测试会以 FAILED 开头，后面跟着测试路径
           if grep -q "FAILED" .test_durations; then
+            echo "❌ FAILED TESTS DETECTED"
             echo "Extracting failed tests..."
             # 提取失败的测试路径（假设格式为 "FAILED source/tests/path/to/test.py::TestClass::test_method"）
             grep "FAILED" .test_durations | sed 's/.*FAILED //' | sed 's/::.*//' | sort -u > "$FAILED_TESTS_FILE"
             echo "Failed tests saved:"
             cat "$FAILED_TESTS_FILE"
           else
-            echo "No failed tests found."
+            echo "✅ NO FAILED TESTS FOUND"
             # 如果没有失败测试，删除可能存在的旧文件
             rm -f "$FAILED_TESTS_FILE"
           fi
