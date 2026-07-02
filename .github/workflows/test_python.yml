@@ -47,7 +47,8 @@ jobs:
           export PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')
           source/install/uv_with_retry.sh pip install --system -e .[test,jax,torch] mpi4py --group pin_jax_cpu
           source/install/uv_with_retry.sh pip install --system --find-links "https://www.paddlepaddle.org.cn/packages/nightly/cpu/paddlepaddle/" --index-url https://pypi.org/simple --trusted-host www.paddlepaddle.org.cn --trusted-host paddlepaddle.org.cn paddlepaddle==3.4.0.dev20260310
-          python -m pip install pytest array-api-strict
+          # 移除了 pytest-testmon，改用原生 pytest
+          python -m pip install array-api-strict
         env:
           DP_ENABLE_PYTORCH: 1
           DP_BUILD_TESTING: 1
@@ -56,15 +57,41 @@ jobs:
           HOROVOD_WITH_MPI: 1
           CMAKE_POLICY_VERSION_MINIMUM: 3.5
 
-      # ==================== 动态检测修改文件并映射测试路径 ====================
-      - name: Detect affected tests and map test paths
-        if: github.event_name == 'pull_request'
+      # ==================== 基于 Git Diff 的精准测试选择 ====================
+      - name: Detect affected tests
         id: affected
         run: |
           echo "Detecting affected tests..."
           
-          # 获取修改的文件列表
-          CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }})
+          # 根据事件类型确定 Base SHA
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            # 处理首次推送（before 是全 0）的情况
+            if [[ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]]; then
+              echo "First push detected, comparing with HEAD~1"
+              BASE_SHA="HEAD~1"
+            else
+              BASE_SHA="${{ github.event.before }}"
+            fi
+          else
+            # Schedule 或其他事件，默认与 main 分支比较
+            git fetch origin main
+            BASE_SHA="origin/main"
+          fi
+          
+          echo "Base SHA: $BASE_SHA"
+          echo "Head SHA: ${{ github.sha }}"
+          
+          # 获取变更的文件列表（排除删除的文件）
+          CHANGED_FILES=$(git diff --name-only --diff-filter=d $BASE_SHA ${{ github.sha }})
+          
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No files changed."
+            echo "skip_all=true" >> $GITHUB_OUTPUT
+            echo "selected_paths=source/tests/" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           
           echo "Changed files:"
           echo "$CHANGED_FILES"
@@ -72,11 +99,8 @@ jobs:
           # 初始化测试路径列表
           TEST_PATHS=""
           
-          # 定义映射规则
-          # 规则1: source/deepmd/xxx.py -> source/tests/test_xxx.py
-          # 规则2: source/deepmd/xxx/yyy.py -> source/tests/xxx/test_yyy.py
-          # 规则3: 如果是测试文件本身被修改，直接运行它
-          
+          # 定义映射规则：源码目录 -> 测试目录
+          # 注意：根据你的项目实际结构调整这些映射关系
           while IFS= read -r file; do
             if [[ -z "$file" ]]; then
               continue
@@ -116,7 +140,7 @@ jobs:
             fi
           done <<< "$CHANGED_FILES"
           
-          # 如果没有找到任何测试路径，运行所有测试
+          # 如果没有找到任何测试路径，运行所有测试（安全兜底）
           if [[ -z "$TEST_PATHS" ]]; then
             echo "No specific tests found, will run all tests"
             TEST_PATHS="source/tests"
@@ -129,44 +153,27 @@ jobs:
           
           # 输出到 GitHub Actions
           echo "skip_all=$SKIP_ALL" >> $GITHUB_OUTPUT
-          echo "test_paths=$TEST_PATHS" >> $GITHUB_OUTPUT
+          echo "selected_paths=$TEST_PATHS" >> $GITHUB_OUTPUT
         shell: bash
-
-      # 非 PR 事件，运行所有测试
-      - name: Set default test paths for non-PR
-        if: github.event_name != 'pull_request'
-        id: default_affected
-        run: |
-          echo "skip_all=false" >> $GITHUB_OUTPUT
-          echo "test_paths=source/tests" >> $GITHUB_OUTPUT
 
       - name: Check if should skip
         id: check_skip
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "skip_all=${{ steps.affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
-          else
-            echo "skip_all=${{ steps.default_affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
-          fi
+          echo "skip_all=${{ steps.affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
 
-      # 运行测试（动态指定测试路径）
+      # 运行测试（基于选中的路径）
       - name: Run tests via pytest
         if: steps.check_skip.outputs.skip_all != 'true'
         timeout-minutes: 180
         run: |
-          echo "Starting pytest with dynamic test selection..."
+          echo "Starting pytest with incremental selection..."
           
-          # 获取测试路径
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            TEST_PATHS="${{ steps.affected.outputs.test_paths }}"
-          else
-            TEST_PATHS="${{ steps.default_affected.outputs.test_paths }}"
-          fi
+          # 获取选定的测试路径
+          SELECTED_PATHS="${{ steps.affected.outputs.selected_paths }}"
+          echo "Running tests for paths: $SELECTED_PATHS"
           
-          echo "Test paths to run: $TEST_PATHS"
-          
-          # 运行测试
-          pytest -vv --cov=deepmd $TEST_PATHS \
+          # 运行选定的测试
+          pytest -vv --cov=deepmd $SELECTED_PATHS \
             --splits 12 --group ${{ matrix.group }} \
             --store-durations --clean-durations \
             --durations-path=.test_durations \
