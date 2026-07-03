@@ -238,6 +238,13 @@ jobs:
           echo "=========================================="
         shell: bash
 
+      - name: Debug affected outputs
+        run: |
+          echo "Debugging affected step outputs:"
+          echo "skip_all: ${{ steps.affected.outputs.skip_all }}"
+          echo "selected_paths: ${{ steps.affected.outputs.selected_paths }}"
+          echo "Is selected_paths empty? ${{ steps.affected.outputs.selected_paths == '' }}"
+
       - name: Check if should skip
         id: check_skip
         run: |
