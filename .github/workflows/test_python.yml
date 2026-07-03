@@ -83,14 +83,11 @@ jobs:
             BASE_SHA="${{ github.event.pull_request.base.sha }}"
             echo "PR Base SHA: $BASE_SHA"
           elif [[ "${{ github.event_name }}" == "push" ]]; then
-            # 处理首次推送（before 是全 0）的情况
-            if [[ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]]; then
-              echo "First push detected, comparing with HEAD~1"
-              BASE_SHA="HEAD~1"
-            else
-              BASE_SHA="${{ github.event.before }}"
-              echo "Push Before SHA: $BASE_SHA"
-            fi
+            # 关键修复：使用 git merge-base 获取准确的基准提交
+            echo "Fetching origin/main for merge-base calculation..."
+            git fetch origin main
+            BASE_SHA=$(git merge-base HEAD origin/main)
+            echo "Push Event: Calculated Merge Base SHA: $BASE_SHA"
           else
             # Schedule 或其他事件，默认与 main 分支比较
             git fetch origin main
@@ -108,6 +105,10 @@ jobs:
           if [ -z "$CHANGED_FILES" ]; then
             echo "❌ NO FILES CHANGED"
             echo "This means git diff returned empty"
+            echo "Possible reasons:"
+            echo "  1. No actual changes in the commit"
+            echo "  2. All changes are deletions (filtered out by --diff-filter=d)"
+            echo "  3. Base SHA calculation failed"
             SELECTED_PATHS=""
           else
             echo "✅ CHANGED FILES DETECTED:"
@@ -120,7 +121,7 @@ jobs:
             # 定义映射规则：源码目录 -> 测试目录
             echo "🗺️ MAPPING RULES:"
             echo "  Rule 1: source/tests/* → Direct test file"
-            echo "  Rule 2: source/deepmd/*.py → Possible test locations"
+            echo "  Rule 2: source/deepmd/*.py → Test locations in consistent/unit/integration"
             echo ""
             
             # 统计变量
@@ -148,16 +149,26 @@ jobs:
                 # 提取模块路径
                 MODULE_PATH=${file#source/deepmd/}
                 MODULE_NAME=${MODULE_PATH%.py}
+                BASENAME=$(basename ${MODULE_PATH})
+                DIRNAME=$(dirname ${MODULE_NAME})
                 
-                echo "  🔍 Looking for tests for module: $MODULE_NAME"
+                echo "  🔍 Looking for tests for module: $MODULE_NAME (dir: $DIRNAME, base: $BASENAME)"
                 
-                # 构造可能的测试路径
+                # 构造可能的测试路径（针对你的项目目录结构优化）
                 POSSIBLE_TESTS=(
-                  "source/tests/test_${MODULE_NAME}.py"
-                  "source/tests/${MODULE_NAME}/test_$(basename ${MODULE_PATH})"
-                  "source/tests/$(dirname ${MODULE_NAME})/test_$(basename ${MODULE_PATH})"
-                  "source/tests/integration/test_${MODULE_NAME}.py"
+                  # consistent 目录下的测试（最常见）
+                  "source/tests/consistent/${DIRNAME}/test_${BASENAME}.py"
                   "source/tests/consistent/test_${MODULE_NAME}.py"
+                  # unit 目录下的测试
+                  "source/tests/unit/${DIRNAME}/test_${BASENAME}.py"
+                  "source/tests/unit/test_${MODULE_NAME}.py"
+                  # integration 目录下的测试
+                  "source/tests/integration/${DIRNAME}/test_${BASENAME}.py"
+                  "source/tests/integration/test_${MODULE_NAME}.py"
+                  # 其他可能的位置
+                  "source/tests/test_${MODULE_NAME}.py"
+                  "source/tests/${MODULE_NAME}/test_${BASENAME}.py"
+                  "source/tests/${DIRNAME}/test_${BASENAME}.py"
                 )
                 
                 FOUND_TEST=false
