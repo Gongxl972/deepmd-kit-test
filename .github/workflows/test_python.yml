@@ -224,9 +224,14 @@ jobs:
             SKIP_ALL="false"
           fi
           
-          # 输出到 GitHub Actions
+          # 关键修复：确保输出变量被正确设置
           echo "skip_all=$SKIP_ALL" >> $GITHUB_OUTPUT
           echo "selected_paths=$SELECTED_PATHS" >> $GITHUB_OUTPUT
+          
+          # 调试：打印输出内容
+          echo "DEBUG: Output variables set:"
+          echo "  skip_all=$SKIP_ALL"
+          echo "  selected_paths=$SELECTED_PATHS"
           
           echo "=========================================="
           echo "✅ FINISHED AFFECTED TESTS DETECTION"
