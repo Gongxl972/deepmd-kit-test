@@ -24,4 +24,4 @@ class DPEnergyAtomicModel(DPAtomicModel):
                 "fitting must be an instance of EnergyFittingNet or InvarFitting for DPEnergyAtomicModel"
             )
         super().__init__(descriptor, fitting, type_map, **kwargs)
-#test gitdiff
+#test 
