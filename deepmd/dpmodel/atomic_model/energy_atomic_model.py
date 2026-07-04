@@ -25,3 +25,5 @@ class DPEnergyAtomicModel(DPAtomicModel):
             )
         super().__init__(descriptor, fitting, type_map, **kwargs)
 #test 
+def test_force_fail():
+    assert 1 == 2
