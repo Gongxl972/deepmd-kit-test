@@ -84,13 +84,24 @@ jobs:
             echo "PR Base SHA: $BASE_SHA"
           elif [[ "${{ github.event_name }}" == "push" ]]; then
             echo "Push Event detected"
-            echo "Fetching origin/main for merge-base calculation..."
-            git fetch origin main
-
-            # 关键修复：使用 merge-base 确保 Push 事件也能精准获取变更
-            BASE_SHA=$(git merge-base HEAD origin/main)
-            echo "Push Event: Calculated Merge Base SHA: $BASE_SHA"
+            
+            # 关键修复：不依赖 git fetch，直接尝试获取 merge-base
+            # 检查远程分支是否存在
+            if git show-ref --verify --quiet refs/remotes/origin/main; then
+              echo "Found origin/main branch"
+              BASE_SHA=$(git merge-base HEAD origin/main)
+              echo "Push Event: Calculated Merge Base SHA with origin/main: $BASE_SHA"
+            elif git show-ref --verify --quiet refs/remotes/origin/master; then
+              echo "Found origin/master branch"
+              BASE_SHA=$(git merge-base HEAD origin/master)
+              echo "Push Event: Calculated Merge Base SHA with origin/master: $BASE_SHA"
+            else
+              # 如果没有远程分支，使用 HEAD~1（仅本次提交）
+              echo "⚠️ Warning: No remote main/master branch found. Using HEAD~1 as base."
+              BASE_SHA="HEAD~1"
+            fi
           else
+            # Schedule 或其他事件
             git fetch origin main
             BASE_SHA="origin/main"
             echo "Schedule/Other Event Base SHA: $BASE_SHA"
@@ -169,6 +180,7 @@ jobs:
 
                 if [[ "$FOUND_TEST" == "false" ]]; then
                   echo "  ❌ NO MATCH: Could not find test for $file"
+                  echo "    Tried: ${POSSIBLE_TESTS[@]}"
                   UNMATCHED_FILES=$((UNMATCHED_FILES + 1))
                 fi
 
@@ -349,3 +361,4 @@ jobs:
         uses: re-actors/alls-green@release/v1
         with:
           jobs: ${{ toJSON(needs) }}
+    
