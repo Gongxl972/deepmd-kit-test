@@ -77,132 +77,85 @@ jobs:
           echo "Ref: ${{ github.ref }}"
           echo "SHA: ${{ github.sha }}"
           echo ""
-          
+
           # 根据事件类型确定 Base SHA
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             BASE_SHA="${{ github.event.pull_request.base.sha }}"
             echo "PR Base SHA: $BASE_SHA"
           elif [[ "${{ github.event_name }}" == "push" ]]; then
             echo "Push Event detected"
-            
-            # 方法1：尝试使用 github.event.before（如果存在且不是全0）
-            if [[ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
-              BASE_SHA="${{ github.event.before }}"
-              echo "Using github.event.before as base: $BASE_SHA"
-            else
-              # 方法2：尝试获取 origin/main 的引用
-              echo "First push detected, trying to get origin/main..."
-              git fetch origin main 2>/dev/null || git fetch origin master 2>/dev/null || true
-              
-              # 尝试多种可能的基准提交
-              BASE_SHA=""
-              
-              # 尝试1：使用 origin/main
-              if git rev-parse --verify origin/main >/dev/null 2>&1; then
-                BASE_SHA=$(git merge-base HEAD origin/main 2>/dev/null || echo "")
-                if [[ -n "$BASE_SHA" ]]; then
-                  echo "Using merge-base with origin/main: $BASE_SHA"
-                fi
-              fi
-              
-              # 尝试2：使用 origin/master（如果 origin/main 不存在）
-              if [[ -z "$BASE_SHA" ]] && git rev-parse --verify origin/master >/dev/null 2>&1; then
-                BASE_SHA=$(git merge-base HEAD origin/master 2>/dev/null || echo "")
-                if [[ -n "$BASE_SHA" ]]; then
-                  echo "Using merge-base with origin/master: $BASE_SHA"
-                fi
-              fi
-              
-              # 尝试3：使用 HEAD~1（如果以上都失败）
-              if [[ -z "$BASE_SHA" ]]; then
-                BASE_SHA="HEAD~1"
-                echo "Fallback to HEAD~1: $BASE_SHA"
-              fi
-            fi
+            echo "Fetching origin/main for merge-base calculation..."
+            git fetch origin main
+
+            # 关键修复：使用 merge-base 确保 Push 事件也能精准获取变更
+            BASE_SHA=$(git merge-base HEAD origin/main)
+            echo "Push Event: Calculated Merge Base SHA: $BASE_SHA"
           else
-            # Schedule 或其他事件，默认与 main 分支比较
-            git fetch origin main 2>/dev/null || git fetch origin master 2>/dev/null || true
+            git fetch origin main
             BASE_SHA="origin/main"
             echo "Schedule/Other Event Base SHA: $BASE_SHA"
           fi
-          
+
           echo "Final Base SHA for comparison: $BASE_SHA"
           echo "Head SHA: ${{ github.sha }}"
           echo ""
-          
+
           # 获取变更的文件列表（排除删除的文件）
           echo "📁 RUNNING GIT DIFF..."
           CHANGED_FILES=$(git diff --name-only --diff-filter=d $BASE_SHA ${{ github.sha }})
-          
+
           if [ -z "$CHANGED_FILES" ]; then
             echo "❌ NO FILES CHANGED"
-            echo "This means git diff returned empty"
-            echo "Possible reasons:"
-            echo "  1. No actual changes in the commit"
-            echo "  2. All changes are deletions (filtered out by --diff-filter=d)"
-            echo "  3. Base SHA calculation failed"
             SELECTED_PATHS=""
           else
             echo "✅ CHANGED FILES DETECTED:"
             echo "$CHANGED_FILES"
             echo ""
-            
-            # 初始化测试路径列表
+
             TEST_PATHS=""
-            
-            # 定义映射规则：源码目录 -> 测试目录
-            echo "🗺️ MAPPING RULES:"
-            echo "  Rule 1: source/tests/* → Direct test file"
-            echo "  Rule 2: source/deepmd/*.py → Test locations in consistent/unit/integration"
-            echo ""
-            
-            # 统计变量
             MATCHED_FILES=0
             UNMATCHED_FILES=0
-            
+
             while IFS= read -r file; do
               if [[ -z "$file" ]]; then
                 continue
               fi
-              
+
               echo "Processing file: $file"
-              
-              # 如果是测试文件本身被修改
+
+              # 规则 1: 直接修改了测试文件
               if [[ "$file" == source/tests/* ]]; then
                 if [[ -f "$file" ]]; then
                   TEST_PATHS="$TEST_PATHS $file"
-                  echo "  ✅ MATCHED: Test file directly added: $file"
+                  echo "  ✅ MATCHED (Test file): $file"
                   MATCHED_FILES=$((MATCHED_FILES + 1))
-                else
-                  echo "  ⚠️ WARNING: Test file listed but not found: $file"
                 fi
-              # 如果是源代码文件
+
+              # 规则 2: 修改了 deepmd 源码 (核心修复)
               elif [[ "$file" == source/deepmd/* ]] && [[ "$file" == *.py ]]; then
-                # 提取模块路径
+                # 提取相对路径 (例如: nnp/descriptor.py)
                 MODULE_PATH=${file#source/deepmd/}
-                MODULE_NAME=${MODULE_PATH%.py}
-                BASENAME=$(basename ${MODULE_PATH})
-                DIRNAME=$(dirname ${MODULE_NAME})
-                
-                echo "  🔍 Looking for tests for module: $MODULE_NAME (dir: $DIRNAME, base: $BASENAME)"
-                
-                # 构造可能的测试路径（针对你的项目目录结构优化）
+                BASENAME=$(basename "$MODULE_PATH")
+
+                # 关键修复：正确处理 deepmd/nnp/descriptor.py -> nnp
+                DIRNAME=$(dirname "$MODULE_PATH")
+
+                echo "  🔍 Looking for tests for module: $MODULE_PATH (Dir: $DIRNAME, File: $BASENAME)"
+
+                # 构造测试路径 (针对 deepmd 目录结构优化)
                 POSSIBLE_TESTS=(
-                  # consistent 目录下的测试（最常见）
-                  "source/tests/consistent/${DIRNAME}/test_${BASENAME}.py"
-                  "source/tests/consistent/test_${MODULE_NAME}.py"
-                  # unit 目录下的测试
-                  "source/tests/unit/${DIRNAME}/test_${BASENAME}.py"
-                  "source/tests/unit/test_${MODULE_NAME}.py"
-                  # integration 目录下的测试
-                  "source/tests/integration/${DIRNAME}/test_${BASENAME}.py"
-                  "source/tests/integration/test_${MODULE_NAME}.py"
-                  # 其他可能的位置
-                  "source/tests/test_${MODULE_NAME}.py"
-                  "source/tests/${MODULE_NAME}/test_${BASENAME}.py"
-                  "source/tests/${DIRNAME}/test_${BASENAME}.py"
+                  # 对应 source/tests/consistent/nnp/test_descriptor.py
+                  "source/tests/consistent/${DIRNAME}/test_${BASENAME}"
+                  "source/tests/consistent/test_${MODULE_PATH%.py}"
+
+                  # 对应 source/tests/unit/nnp/test_descriptor.py
+                  "source/tests/unit/${DIRNAME}/test_${BASENAME}"
+                  "source/tests/unit/test_${MODULE_PATH%.py}"
+
+                  # 兜底路径
+                  "source/tests/test_${MODULE_PATH%.py}"
                 )
-                
+
                 FOUND_TEST=false
                 for test_path in "${POSSIBLE_TESTS[@]}"; do
                   if [[ -f "$test_path" ]]; then
@@ -213,69 +166,50 @@ jobs:
                     break
                   fi
                 done
-                
+
                 if [[ "$FOUND_TEST" == "false" ]]; then
                   echo "  ❌ NO MATCH: Could not find test for $file"
-                  echo "    Tried: ${POSSIBLE_TESTS[@]}"
                   UNMATCHED_FILES=$((UNMATCHED_FILES + 1))
                 fi
+
               else
-                echo "  ⚠️ UNKNOWN FILE TYPE: $file"
-                echo "    Does not match source/tests/* or source/deepmd/*.py"
-                UNMATCHED_FILES=$((UNMATCHED_FILES + 1))
+                echo "  ⚠️ SKIPPED (Unknown type): $file"
               fi
             done <<< "$CHANGED_FILES"
-            
+
             echo ""
             echo "📊 MAPPING SUMMARY:"
             echo "  Total changed files: $(echo "$CHANGED_FILES" | wc -l)"
-            echo "  Matched to tests: $MATCHED_FILES"
-            echo "  Unmatched: $UNMATCHED_FILES"
+            echo "  Successfully mapped: $MATCHED_FILES"
+            echo "  Unmatched/Failed: $UNMATCHED_FILES"
             echo ""
-            
+
             SELECTED_PATHS="$TEST_PATHS"
           fi
-          
-          # 检查是否有缓存的失败测试需要重跑
+
+          # 合并缓存的失败测试
           FAILED_TESTS_FILE=".failed_tests_${{ matrix.python }}_${{ matrix.group }}"
           if [ -f "$FAILED_TESTS_FILE" ]; then
             echo "💾 FOUND CACHED FAILED TESTS:"
             cat "$FAILED_TESTS_FILE"
-            echo ""
-            # 将失败测试添加到选中路径中
             SELECTED_PATHS="$SELECTED_PATHS $(cat $FAILED_TESTS_FILE)"
             echo "Added failed tests to run list"
-          else
-            echo "💾 NO CACHED FAILED TESTS FOUND"
           fi
-          
-          # 如果没有找到任何测试路径，运行所有测试（安全兜底）
+
+          # 最终兜底
           if [[ -z "$SELECTED_PATHS" ]]; then
             echo "🚨 TRIGGERING FULL TEST SUITE (NO SPECIFIC TESTS FOUND)"
-            echo "Reasons why this might happen:"
-            echo "  1. No files changed"
-            echo "  2. Changed files don't match any mapping rules"
-            echo "  3. All mapped tests were filtered out"
-            echo ""
             SELECTED_PATHS="source/tests"
             SKIP_ALL="false"
           else
             echo "🎯 SPECIFIC TESTS SELECTED:"
             echo "$SELECTED_PATHS"
-            echo ""
-            echo "Number of test paths: $(echo "$SELECTED_PATHS" | wc -w)"
             SKIP_ALL="false"
           fi
-          
-          # 关键修复：确保输出变量被正确设置
+
           echo "skip_all=$SKIP_ALL" >> $GITHUB_OUTPUT
           echo "selected_paths=$SELECTED_PATHS" >> $GITHUB_OUTPUT
-          
-          # 调试：打印输出内容
-          echo "DEBUG: Output variables set:"
-          echo "  skip_all=$SKIP_ALL"
-          echo "  selected_paths=$SELECTED_PATHS"
-          
+
           echo "=========================================="
           echo "✅ FINISHED AFFECTED TESTS DETECTION"
           echo "=========================================="
@@ -303,29 +237,22 @@ jobs:
         run: |
           echo "🚀 STARTING PYTEST WITH INCREMENTAL SELECTION"
           echo "============================================="
-          
-          # 获取选定的测试路径
+
           SELECTED_PATHS="${{ steps.affected.outputs.selected_paths }}"
           echo "Selected test paths: $SELECTED_PATHS"
           echo ""
-          
-          # 统计测试路径数量
+
           PATH_COUNT=$(echo "$SELECTED_PATHS" | wc -w)
           echo "Number of test paths: $PATH_COUNT"
           echo ""
-          
-          # 如果是全量测试，给出警告
+
           if [[ "$SELECTED_PATHS" == "source/tests" ]]; then
             echo "⚠️ WARNING: Running FULL TEST SUITE"
-            echo "This will take a long time!"
           else
             echo "✅ Running incremental tests only"
           fi
           echo ""
-          
-          # 运行选定的测试
-          echo "Running pytest command..."
-          # 关键修改：添加 --disable-warnings 和 || true 来忽略退出码 5（测试被跳过）
+
           pytest -vv --cov=deepmd $SELECTED_PATHS \
             --splits 12 --group ${{ matrix.group }} \
             --store-durations --clean-durations \
@@ -353,27 +280,20 @@ jobs:
 
       # ==================== 保存失败测试缓存 ====================
       - name: Save failed tests cache
-        if: always()  # 无论测试成功还是失败，都运行此步骤
+        if: always()
         run: |
           echo "💾 SAVING FAILED TESTS CACHE"
           echo "============================="
-          
-          # 创建失败测试文件
+
           FAILED_TESTS_FILE=".failed_tests_${{ matrix.python }}_${{ matrix.group }}"
-          
-          # 从 pytest 输出中提取失败的测试
-          # 注意：这里需要根据你的 pytest 输出格式来调整
-          # 通常失败测试会以 FAILED 开头，后面跟着测试路径
+
           if grep -q "FAILED" .test_durations; then
             echo "❌ FAILED TESTS DETECTED"
-            echo "Extracting failed tests..."
-            # 提取失败的测试路径（假设格式为 "FAILED source/tests/path/to/test.py::TestClass::test_method"）
             grep "FAILED" .test_durations | sed 's/.*FAILED //' | sed 's/::.*//' | sort -u > "$FAILED_TESTS_FILE"
             echo "Failed tests saved:"
             cat "$FAILED_TESTS_FILE"
           else
             echo "✅ NO FAILED TESTS FOUND"
-            # 如果没有失败测试，删除可能存在的旧文件
             rm -f "$FAILED_TESTS_FILE"
           fi
         shell: bash
