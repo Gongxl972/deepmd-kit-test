@@ -83,18 +83,50 @@ jobs:
             BASE_SHA="${{ github.event.pull_request.base.sha }}"
             echo "PR Base SHA: $BASE_SHA"
           elif [[ "${{ github.event_name }}" == "push" ]]; then
-            # 关键修复：使用 git merge-base 获取准确的基准提交
-            echo "Fetching origin/main for merge-base calculation..."
-            git fetch origin main
-            BASE_SHA=$(git merge-base HEAD origin/main)
-            echo "Push Event: Calculated Merge Base SHA: $BASE_SHA"
+            echo "Push Event detected"
+            
+            # 方法1：尝试使用 github.event.before（如果存在且不是全0）
+            if [[ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+              BASE_SHA="${{ github.event.before }}"
+              echo "Using github.event.before as base: $BASE_SHA"
+            else
+              # 方法2：尝试获取 origin/main 的引用
+              echo "First push detected, trying to get origin/main..."
+              git fetch origin main 2>/dev/null || git fetch origin master 2>/dev/null || true
+              
+              # 尝试多种可能的基准提交
+              BASE_SHA=""
+              
+              # 尝试1：使用 origin/main
+              if git rev-parse --verify origin/main >/dev/null 2>&1; then
+                BASE_SHA=$(git merge-base HEAD origin/main 2>/dev/null || echo "")
+                if [[ -n "$BASE_SHA" ]]; then
+                  echo "Using merge-base with origin/main: $BASE_SHA"
+                fi
+              fi
+              
+              # 尝试2：使用 origin/master（如果 origin/main 不存在）
+              if [[ -z "$BASE_SHA" ]] && git rev-parse --verify origin/master >/dev/null 2>&1; then
+                BASE_SHA=$(git merge-base HEAD origin/master 2>/dev/null || echo "")
+                if [[ -n "$BASE_SHA" ]]; then
+                  echo "Using merge-base with origin/master: $BASE_SHA"
+                fi
+              fi
+              
+              # 尝试3：使用 HEAD~1（如果以上都失败）
+              if [[ -z "$BASE_SHA" ]]; then
+                BASE_SHA="HEAD~1"
+                echo "Fallback to HEAD~1: $BASE_SHA"
+              fi
+            fi
           else
             # Schedule 或其他事件，默认与 main 分支比较
-            git fetch origin main
+            git fetch origin main 2>/dev/null || git fetch origin master 2>/dev/null || true
             BASE_SHA="origin/main"
             echo "Schedule/Other Event Base SHA: $BASE_SHA"
           fi
           
+          echo "Final Base SHA for comparison: $BASE_SHA"
           echo "Head SHA: ${{ github.sha }}"
           echo ""
           
