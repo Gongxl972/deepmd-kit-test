@@ -93,8 +93,8 @@ jobs:
           for ((retry=1; retry<=MAX_RETRIES; retry++)); do
             echo "Attempt $retry of $MAX_RETRIES..."
             
-            # 使用 heredoc 传递 Python 代码，避免引号嵌套问题
-            if timeout 600 python << 'EOF'
+            # 创建Python脚本文件
+            cat > build_mapping.py << 'PYEOF'
 import json
 import sys
 import os
@@ -181,8 +181,9 @@ with open(".global_test_mapping.json", "w") as f:
 
 elapsed = time.time() - start_time
 print(f"✅ Built global mapping with {len(mapping)} test files in {elapsed:.1f}s")
-EOF
-            then
+PYEOF
+
+            if timeout 600 python build_mapping.py; then
               # 验证映射文件
               if [ -s ".global_test_mapping.json" ]; then
                 echo "✅ Mapping built successfully"
@@ -378,96 +379,121 @@ EOF
           echo "✅ CHANGED FILES DETECTED:"
           echo "$CHANGED_FILES"
           
-          # 使用全局映射查找受影响的测试
-          AFFECTED_TESTS=""
-          MATCHED_FILES=0
-          UNMATCHED_FILES=0
-          NEW_FILES=0
-          NEED_FULL_TEST=false
+          # 创建Python脚本进行复杂逻辑处理
+          cat > detect_affected.py << 'PYEOF'
+import json
+import os
+import subprocess
+import sys
+
+# 读取全局映射
+with open(".global_test_mapping.json", "r") as f:
+    GLOBAL_MAPPING = json.load(f)
+
+changed_files_str = os.environ.get("CHANGED_FILES", "")
+base_sha = os.environ.get("BASE_SHA", "HEAD^")
+
+changed_files = [f.strip() for f in changed_files_str.strip().split("\n") if f.strip()]
+
+AFFECTED_TESTS = set()
+MATCHED_FILES = 0
+UNMATCHED_FILES = 0
+NEW_FILES = 0
+NEED_FULL_TEST = False
+
+for changed_file in changed_files:
+    print(f"Processing changed file: {changed_file}")
+    
+    # 检查文件是否是新添加的
+    result = subprocess.run(["git", "cat-file", "-e", f"{base_sha}:{changed_file}"], 
+                           capture_output=True, text=True)
+    is_new_file = (result.returncode != 0)
+    
+    if is_new_file:
+        print(f"  🆕 File is newly added in this PR")
+        NEW_FILES += 1
+        if changed_file.startswith("source/deepmd/"):
+            print(f"  ⚠️ New source file without test coverage - will trigger full test")
+            NEED_FULL_TEST = True
+        continue
+    else:
+        print(f"  ℹ️ File exists in base branch (modified)")
+    
+    # 规范化文件路径
+    normalized_file = changed_file
+    if changed_file.startswith("deepmd/"):
+        normalized_file = "source/" + changed_file
+    
+    # 在全局映射中查找依赖此文件的测试
+    matching_tests = []
+    for test_file, info in GLOBAL_MAPPING.items():
+        deps = info.get("dependencies", [])
+        if any(normalized_file in dep or dep in normalized_file for dep in deps):
+            matching_tests.append(test_file)
+    
+    if matching_tests:
+        print(f"  ✅ Found {len(matching_tests)} matching tests:")
+        for test_file in matching_tests:
+            print(f"    - {test_file}")
+            AFFECTED_TESTS.add(test_file)
+        MATCHED_FILES += 1
+    else:
+        print(f"  ❌ No tests found depending on {normalized_file}")
+        UNMATCHED_FILES += 1
+
+# 输出结果
+print(f"\n📊 MAPPING SUMMARY:")
+print(f"  Total changed files: {len(changed_files)}")
+print(f"  Files with matching tests: {MATCHED_FILES}")
+print(f"  Files without matches: {UNMATCHED_FILES}")
+print(f"  New files added: {NEW_FILES}")
+print(f"  Need full test: {NEED_FULL_TEST}")
+
+# 去重并排序
+if AFFECTED_TESTS:
+    AFFECTED_TESTS_sorted = sorted(AFFECTED_TESTS)
+    print(f"\n🎯 AFFECTED TESTS: {' '.join(AFFECTED_TESTS_sorted)}")
+
+# 决定是否全量测试
+if NEED_FULL_TEST or not AFFECTED_TESTS:
+    print(f"\n🚨 TRIGGERING FULL TEST SUITE")
+    print("selected_paths=source/tests")
+    print("skip_all=false")
+    print("need_full_test=true")
+else:
+    print(f"\n🎯 RUNNING INCREMENTAL TESTS ONLY")
+    print(f"selected_paths={' '.join(AFFECTED_TESTS_sorted)}")
+    print("skip_all=false")
+    print("need_full_test=false")
+PYEOF
+
+          # 设置环境变量供Python脚本使用
+          echo "CHANGED_FILES<<EOF" >> $GITHUB_ENV
+          echo "$CHANGED_FILES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
           
-          # 加载全局映射
-          python -c '
-          import json
-          import sys
-          import subprocess
+          # 运行Python脚本并捕获输出
+          python detect_affected.py > detection_output.txt 2>&1
           
-          with open(".global_test_mapping.json", "r") as f:
-              GLOBAL_MAPPING = json.load(f)
+          # 从输出文件读取结果并设置输出变量
+          if grep -q "selected_paths=" detection_output.txt; then
+            grep "selected_paths=" detection_output.txt >> $GITHUB_OUTPUT
+          else
+            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+          fi
           
-          changed_files = """'"$CHANGED_FILES"'"""
-          for changed_file in changed_files.strip().split("\n"):
-              if not changed_file:
-                  continue
-              
-              print(f"Processing changed file: {changed_file}")
-              
-              # 检查文件是否是新添加的
-              result = subprocess.run(["git", "cat-file", "-e", "'"$BASE_SHA"'":changed_file], 
-                                     capture_output=True, text=True)
-              is_new_file = (result.returncode != 0)
-              
-              if is_new_file:
-                  print(f"  🆕 File is newly added in this PR")
-                  NEW_FILES += 1
-                  if changed_file.startswith("source/deepmd/"):
-                      print(f"  ⚠️ New source file without test coverage - will trigger full test")
-                      NEED_FULL_TEST = True
-                  continue
-              else:
-                  print(f"  ℹ️ File exists in base branch (modified)")
-              
-              # 规范化文件路径
-              normalized_file = changed_file
-              if changed_file.startswith("deepmd/"):
-                  normalized_file = "source/" + changed_file
-              
-              # 在全局映射中查找依赖此文件的测试
-              matching_tests = []
-              for test_file, info in GLOBAL_MAPPING.items():
-                  deps = info.get("dependencies", [])
-                  if any(normalized_file in dep or dep in normalized_file for dep in deps):
-                      matching_tests.append(test_file)
-              
-              if matching_tests:
-                  print(f"  ✅ Found {len(matching_tests)} matching tests:")
-                  for test_file in matching_tests:
-                      print(f"    - {test_file}")
-                      AFFECTED_TESTS += " " + test_file
-                  MATCHED_FILES += 1
-              else:
-                  print(f"  ❌ No tests found depending on {normalized_file}")
-                  UNMATCHED_FILES += 1
+          if grep -q "skip_all=" detection_output.txt; then
+            grep "skip_all=" detection_output.txt >> $GITHUB_OUTPUT
+          else
+            echo "skip_all=false" >> $GITHUB_OUTPUT
+          fi
           
-          # 输出结果
-          print(f"\n📊 MAPPING SUMMARY:")
-          print(f"  Total changed files: {len(changed_files.strip().split(chr(10)))}")
-          print(f"  Files with matching tests: {MATCHED_FILES}")
-          print(f"  Files without matches: {UNMATCHED_FILES}")
-          print(f"  New files added: {NEW_FILES}")
-          print(f"  Need full test: {NEED_FULL_TEST}")
-          
-          # 去重并排序
-          if AFFECTED_TESTS:
-              AFFECTED_TESTS = " ".join(sorted(set(AFFECTED_TESTS.split())))
-              print(f"\n🎯 AFFECTED TESTS: {AFFECTED_TESTS}")
-          
-          # 决定是否全量测试
-          if NEED_FULL_TEST or not AFFECTED_TESTS:
-              print(f"\n🚨 TRIGGERING FULL TEST SUITE")
-              print("selected_paths=source/tests")
-              print("skip_all=false")
-              print("need_full_test=true")
-          else:
-              print(f"\n🎯 RUNNING INCREMENTAL TESTS ONLY")
-              print(f"selected_paths={AFFECTED_TESTS}")
-              print("skip_all=false")
-              print("need_full_test=false")
-          ' > detection_output.txt
-          
-          # 从输出文件读取结果
-          grep "selected_paths=" detection_output.txt >> $GITHUB_OUTPUT
-          grep "skip_all=" detection_output.txt >> $GITHUB_OUTPUT
-          grep "need_full_test=" detection_output.txt >> $GITHUB_OUTPUT
+          if grep -q "need_full_test=" detection_output.txt; then
+            grep "need_full_test=" detection_output.txt >> $GITHUB_OUTPUT
+          else
+            echo "need_full_test=true" >> $GITHUB_OUTPUT
+          fi
           
           echo "=========================================="
           echo "✅ FINISHED AFFECTED TESTS DETECTION"
