@@ -93,7 +93,7 @@ jobs:
           for ((retry=1; retry<=MAX_RETRIES; retry++)); do
             echo "Attempt $retry of $MAX_RETRIES..."
             
-            # 创建Python脚本文件（关键修复：使用独立文件）
+            # 创建Python脚本文件
             cat > build_mapping.py << 'PYEOF'
 import json
 import sys
@@ -332,5 +332,4 @@ PYEOF
           # 验证全局映射文件
           if [ ! -f ".global_test_mapping.json" ] || [ ! -s ".global_test_mapping.json" ]; then
             echo "❌ ERROR: Global mapping file not found or empty!"
-            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
-            echo "skip_all=false" >> $
+            echo "selected_paths=source/tests
