@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+检测受影响的测试的脚本
+用于 GitHub Actions 工作流中
+"""
+
 import json
 import os
 import sys
@@ -7,18 +12,37 @@ import subprocess
 def main():
     # 从环境变量获取参数
     mapping_file = ".global_test_mapping.json"
-    changed_files_str = os.environ.get("CHANGED_FILES", "")
-    base_sha = os.environ.get("BASE_SHA", "")
     
+    # 获取变更的文件列表
+    changed_files_str = os.environ.get("CHANGED_FILES", "")
     if not changed_files_str:
         print("No changed files found.")
-        sys.exit(0)
+        print("selected_paths=source/tests")
+        print("skip_all=false")
+        print("need_full_test=true")
+        return
     
     changed_files = [f.strip() for f in changed_files_str.strip().split("\n") if f.strip()]
     
+    # 获取基础 SHA
+    base_sha = os.environ.get("BASE_SHA", "")
+    if not base_sha:
+        print("Error: BASE_SHA not set", file=sys.stderr)
+        print("selected_paths=source/tests")
+        print("skip_all=false")
+        print("need_full_test=true")
+        return
+    
     # 加载全局映射
-    with open(mapping_file, "r") as f:
-        global_mapping = json.load(f)
+    try:
+        with open(mapping_file, "r") as f:
+            global_mapping = json.load(f)
+    except Exception as e:
+        print(f"Error reading mapping file: {e}", file=sys.stderr)
+        print("selected_paths=source/tests")
+        print("skip_all=false")
+        print("need_full_test=true")
+        return
     
     affected_tests = set()
     matched_files = 0
@@ -56,6 +80,7 @@ def main():
         matching_tests = []
         for test_file, info in global_mapping.items():
             deps = info.get("dependencies", [])
+            # 使用更灵活的匹配：检查文件是否在依赖列表中
             if any(normalized_file in dep or dep in normalized_file for dep in deps):
                 matching_tests.append(test_file)
         
