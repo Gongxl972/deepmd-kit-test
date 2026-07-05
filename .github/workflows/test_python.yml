@@ -80,121 +80,26 @@ jobs:
           TOTAL_FILES=$(wc -l < test_files.txt)
           echo "Found $TOTAL_FILES test files"
           
-          # 构建全局映射（带超时保护和重试）
-          MAX_RETRIES=3
-          RETRY_DELAY=10
-          SUCCESS=false
+          # 运行Python脚本构建全局映射
+          python .github/scripts/build_global_mapping.py
           
-          for ((retry=1; retry<=MAX_RETRIES; retry++)); do
-            echo "Attempt $retry of $MAX_RETRIES..."
-            
-            # 创建初始空JSON对象
-            echo "{}" > .global_test_mapping.json
-            
-            # 处理每个测试文件
-            while IFS= read -r test_file; do
-              if [ ! -f "$test_file" ]; then
-                continue
-              fi
-              
-              # 使用Python进行AST解析，但避免import json
-              python -c '
-import ast
-import sys
-import os
-
-test_file = sys.argv[1]
-dependencies = []
-test_functions = []
-
-try:
-    with open(test_file, "r") as f:
-        content = f.read()
-    
-    # 跳过过大的文件
-    if len(content) > 1024000:
-        print(f"Skipping large file: {test_file}")
-        sys.exit(0)
-    
-    tree = ast.parse(content)
-    
-    for node in ast.walk(tree):
-        # 收集测试函数
-        if isinstance(node, ast.FunctionDef):
-            if node.name.startswith("test_"):
-                test_functions.append(node.name)
-        
-        # 收集import deepmd.*
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.startswith("deepmd"):
-                    module_path = alias.name.replace(".", "/") + ".py"
-                    dep = "source/" + module_path
-                    dependencies.append(dep)
-        
-        # 收集from deepmd.xxx import yyy
-        elif isinstance(node, ast.ImportFrom):
-            if node.module and node.module.startswith("deepmd"):
-                base = node.module.replace(".", "/")
-                if node.names:
-                    for alias in node.names:
-                        if alias.name == "*":
-                            dep = f"source/{base}.py"
-                        else:
-                            dep = f"source/{base}/{alias.name}.py"
-                        # 如果文件不存在，尝试__init__.py
-                        if not os.path.exists(dep):
-                            dep = f"source/{base}.py"
-                        dependencies.append(dep)
-except SyntaxError:
-    pass
-except Exception:
-    pass
-
-# 输出为JSON格式，避免import json
-import json
-print(json.dumps({
-    "dependencies": sorted(set(dependencies)),
-    "test_functions": sorted(set(test_functions))
-}))
-' "$test_file" > "${test_file}.deps.json" 2>/dev/null || true
-              
-              # 使用jq合并到全局映射
-              if [ -s "${test_file}.deps.json" ]; then
-                jq --arg file "$test_file" '. + {($file): input}' .global_test_mapping.json "${test_file}.deps.json" > .global_test_mapping.json.tmp && mv .global_test_mapping.json.tmp .global_test_mapping.json
-                rm -f "${test_file}.deps.json"
-              fi
-              
-            done < test_files.txt
-            
-            # 验证映射文件
-            if [ -s ".global_test_mapping.json" ]; then
-              FILE_COUNT=$(jq length .global_test_mapping.json)
-              if [ "$FILE_COUNT" -gt 0 ]; then
-                echo "✅ Mapping built successfully"
-                echo "Final mapping contains $FILE_COUNT test files"
-                SUCCESS=true
-                break
-              else
-                echo "❌ ERROR: Mapping file is empty!"
-              fi
+          # 验证映射文件
+          if [ -s ".global_test_mapping.json" ]; then
+            FILE_COUNT=$(jq length .global_test_mapping.json)
+            if [ "$FILE_COUNT" -gt 0 ]; then
+              echo "✅ Mapping built successfully"
+              echo "Final mapping contains $FILE_COUNT test files"
+              echo "=========================================="
+              echo "✅ GLOBAL MAPPING READY"
+              echo "=========================================="
+              exit 0
             else
-              echo "❌ Attempt $retry failed!"
-              if [ $retry -lt $MAX_RETRIES ]; then
-                echo "Waiting ${RETRY_DELAY}s before retry..."
-                sleep $RETRY_DELAY
-              fi
+              echo "❌ ERROR: Mapping file is empty!"
+              echo "{}" > .global_test_mapping.json
+              exit 1
             fi
-          done
-          
-          if [ "$SUCCESS" = "true" ]; then
-            echo "=========================================="
-            echo "✅ GLOBAL MAPPING READY"
-            echo "=========================================="
-            exit 0
           else
-            echo "❌ ERROR: Failed to build global mapping after $MAX_RETRIES attempts!"
-            echo "Creating empty mapping as fallback..."
+            echo "❌ ERROR: Failed to build global mapping!"
             echo "{}" > .global_test_mapping.json
             exit 1
           fi
@@ -354,104 +259,14 @@ print(json.dumps({
           echo "✅ CHANGED FILES DETECTED:"
           echo "$CHANGED_FILES"
           
-          # 使用jq处理JSON，避免Python
-          # 创建临时脚本来处理复杂的逻辑
-          cat > /tmp/detect_affected.sh << 'SHEOF'
-#!/bin/bash
-
-MAPPING_FILE="$1"
-CHANGED_FILES="$2"
-BASE_SHA="$3"
-
-AFFECTED_TESTS=""
-MATCHED_FILES=0
-UNMATCHED_FILES=0
-NEW_FILES=0
-NEED_FULL_TEST=false
-
-while IFS= read -r changed_file; do
-  if [ -z "$changed_file" ]; then
-    continue
-  fi
-  
-  echo "Processing changed file: $changed_file"
-  
-  # 检查文件是否是新添加的
-  if ! git cat-file -e "$BASE_SHA:$changed_file" 2>/dev/null; then
-    echo "  🆕 File is newly added in this PR"
-    NEW_FILES=$((NEW_FILES + 1))
-    if [[ "$changed_file" == source/deepmd/* ]]; then
-      echo "  ⚠️ New source file without test coverage - will trigger full test"
-      NEED_FULL_TEST=true
-    fi
-    continue
-  else
-    echo "  ℹ️ File exists in base branch (modified)"
-  fi
-  
-  # 规范化文件路径
-  normalized_file="$changed_file"
-  if [[ "$changed_file" == deepmd/* ]]; then
-    normalized_file="source/$changed_file"
-  fi
-  
-  # 使用jq查找依赖此文件的测试
-  # 注意：jq查询需要正确处理JSON结构
-  MATCHING_TESTS=$(jq -r --arg file "$normalized_file" '
-    to_entries[] | 
-    select(.value.dependencies | index($file) // 
-           (.value.dependencies[] | contains($file))) | 
-    .key
-  ' "$MAPPING_FILE" 2>/dev/null)
-  
-  if [ -n "$MATCHING_TESTS" ]; then
-    echo "  ✅ Found matching tests:"
-    echo "$MATCHING_TESTS" | while read -r test_file; do
-      echo "    - $test_file"
-      AFFECTED_TESTS="$AFFECTED_TESTS $test_file"
-    done
-    MATCHED_FILES=$((MATCHED_FILES + 1))
-  else
-    echo "  ❌ No tests found depending on $normalized_file"
-    UNMATCHED_FILES=$((UNMATCHED_FILES + 1))
-  fi
-done <<< "$CHANGED_FILES"
-
-echo ""
-echo "📊 MAPPING SUMMARY:"
-echo "  Total changed files: $(echo "$CHANGED_FILES" | wc -l)"
-echo "  Files with matching tests: $MATCHED_FILES"
-echo "  Files without matches: $UNMATCHED_FILES"
-echo "  New files added: $NEW_FILES"
-echo "  Need full test: $NEED_FULL_TEST"
-
-# 去重并排序
-if [ -n "$AFFECTED_TESTS" ]; then
-  AFFECTED_TESTS_SORTED=$(echo "$AFFECTED_TESTS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-  echo ""
-  echo "🎯 AFFECTED TESTS: $AFFECTED_TESTS_SORTED"
-fi
-
-# 决定是否全量测试
-if [ "$NEED_FULL_TEST" = true ] || [ -z "$AFFECTED_TESTS_SORTED" ]; then
-  echo ""
-  echo "🚨 TRIGGERING FULL TEST SUITE"
-  echo "selected_paths=source/tests"
-  echo "skip_all=false"
-  echo "need_full_test=true"
-else
-  echo ""
-  echo "🎯 RUNNING INCREMENTAL TESTS ONLY"
-  echo "selected_paths=$AFFECTED_TESTS_SORTED"
-  echo "skip_all=false"
-  echo "need_full_test=false"
-fi
-SHEOF
-
-          chmod +x /tmp/detect_affected.sh
+          # 设置环境变量供Python脚本使用
+          echo "CHANGED_FILES<<EOF" >> $GITHUB_ENV
+          echo "$CHANGED_FILES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
           
-          # 运行检测脚本
-          /tmp/detect_affected.sh .global_test_mapping.json "$CHANGED_FILES" "$BASE_SHA" > detection_output.txt 2>&1
+          # 运行Python脚本检测受影响的测试
+          python .github/scripts/detect_affected_tests.py > detection_output.txt 2>&1
           
           # 从输出文件读取结果并设置输出变量
           if grep -q "selected_paths=" detection_output.txt; then
