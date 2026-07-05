@@ -80,7 +80,7 @@ jobs:
           TOTAL_FILES=$(wc -l < test_files.txt)
           echo "Found $TOTAL_FILES test files"
           
-          # 运行Python脚本构建全局映射
+          # 运行Python脚本构建全局映射（脚本在仓库中）
           python .github/scripts/build_global_mapping.py
           
           # 验证映射文件
@@ -265,7 +265,7 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
           echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
           
-          # 运行Python脚本检测受影响的测试
+          # 运行Python脚本检测受影响的测试（脚本在仓库中）
           python .github/scripts/detect_affected_tests.py > detection_output.txt 2>&1
           
           # 从输出文件读取结果并设置输出变量
@@ -431,25 +431,19 @@ jobs:
             echo "{}" > "$GLOBAL_MAPPING"
           fi
           
-          # 使用jq合并所有group映射文件（纯Shell + jq，无Python）
-          # 创建合并脚本
-          cat > /tmp/merge_mappings.jq << 'JQEOF'
-# jq脚本：合并多个映射文件
-.reduce(.[] as $item; {}; 
-  . * $item | 
-  with_entries(
-    .value.dependencies = (.value.dependencies // [] | unique | sort) |
-    .value.test_functions = (.value.test_functions // [] | unique | sort)
-  )
-)
-JQEOF
-          
+          # 使用jq合并所有group映射文件
           # 收集所有JSON文件
           ALL_JSON_FILES=("$GLOBAL_MAPPING" .group_mapping_*.json)
           
           if [ ${#ALL_JSON_FILES[@]} -gt 1 ]; then
             # 使用jq合并所有文件
-            jq -s -f /tmp/merge_mappings.jq "${ALL_JSON_FILES[@]}" > "$GLOBAL_MAPPING.tmp" && mv "$GLOBAL_MAPPING.tmp" "$GLOBAL_MAPPING"
+            jq -s 'reduce .[] as $item ({}; 
+              . * $item | 
+              with_entries(
+                .value.dependencies = (.value.dependencies // [] | unique | sort) |
+                .value.test_functions = (.value.test_functions // [] | unique | sort)
+              )
+            )' "${ALL_JSON_FILES[@]}" > "$GLOBAL_MAPPING.tmp" && mv "$GLOBAL_MAPPING.tmp" "$GLOBAL_MAPPING"
             
             echo "✅ Global mapping now contains $(jq length "$GLOBAL_MAPPING") test files"
             
