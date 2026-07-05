@@ -53,6 +53,26 @@ jobs:
           echo "=========================================="
           echo "🔨 BUILDING GLOBAL TEST MAPPING (SAFE MODE)"
           echo "=========================================="
+          echo "Current working directory: $(pwd)"
+          echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
+          echo "Listing .github directory:"
+          ls -la .github/ || echo ".github directory not found"
+          echo "Listing .github/scripts directory:"
+          ls -la .github/scripts/ || echo ".github/scripts directory not found"
+          
+          # 定义脚本路径（使用绝对路径）
+          SCRIPT_PATH="$GITHUB_WORKSPACE/.github/scripts/build_global_mapping.py"
+          echo "Script path: $SCRIPT_PATH"
+          
+          # 检查脚本是否存在
+          if [ ! -f "$SCRIPT_PATH" ]; then
+            echo "❌ ERROR: Script not found at $SCRIPT_PATH"
+            echo "Searching for script in workspace:"
+            find "$GITHUB_WORKSPACE" -name "build_global_mapping.py" -type f || echo "Script not found anywhere"
+            echo "Creating minimal fallback mapping..."
+            echo "{}" > .global_test_mapping.json
+            exit 1
+          fi
           
           # 如果缓存中有映射文件，直接使用
           if [ -f ".global_test_mapping.json" ] && [ -s ".global_test_mapping.json" ]; then
@@ -80,8 +100,9 @@ jobs:
           TOTAL_FILES=$(wc -l < test_files.txt)
           echo "Found $TOTAL_FILES test files"
           
-          # 运行Python脚本构建全局映射（脚本在仓库中）
-          python .github/scripts/build_global_mapping.py
+          # 运行Python脚本构建全局映射（使用绝对路径）
+          echo "Running script: $SCRIPT_PATH"
+          python "$SCRIPT_PATH"
           
           # 验证映射文件
           if [ -s ".global_test_mapping.json" ]; then
@@ -213,6 +234,26 @@ jobs:
           echo "=========================================="
           echo "🔍 STARTING AFFECTED TESTS DETECTION (GLOBAL MAPPING)"
           echo "=========================================="
+          echo "Current working directory: $(pwd)"
+          echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
+          echo "Listing .github/scripts directory:"
+          ls -la .github/scripts/ || echo ".github/scripts directory not found"
+          
+          # 定义脚本路径（使用绝对路径）
+          SCRIPT_PATH="$GITHUB_WORKSPACE/.github/scripts/detect_affected_tests.py"
+          echo "Script path: $SCRIPT_PATH"
+          
+          # 检查脚本是否存在
+          if [ ! -f "$SCRIPT_PATH" ]; then
+            echo "❌ ERROR: Script not found at $SCRIPT_PATH"
+            echo "Searching for script in workspace:"
+            find "$GITHUB_WORKSPACE" -name "detect_affected_tests.py" -type f || echo "Script not found anywhere"
+            echo "Falling back to full test suite..."
+            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+            echo "skip_all=false" >> $GITHUB_OUTPUT
+            echo "need_full_test=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           
           # 验证全局映射文件
           if [ ! -f ".global_test_mapping.json" ] || [ ! -s ".global_test_mapping.json" ]; then
@@ -265,8 +306,9 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
           echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
           
-          # 运行Python脚本检测受影响的测试（脚本在仓库中）
-          python .github/scripts/detect_affected_tests.py > detection_output.txt 2>&1
+          # 运行Python脚本检测受影响的测试（使用绝对路径）
+          echo "Running script: $SCRIPT_PATH"
+          python "$SCRIPT_PATH" > detection_output.txt 2>&1
           
           # 从输出文件读取结果并设置输出变量
           if grep -q "selected_paths=" detection_output.txt; then
