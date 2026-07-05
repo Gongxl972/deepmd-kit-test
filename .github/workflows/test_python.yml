@@ -53,11 +53,7 @@ jobs:
           echo "Current directory: $(pwd)"
           echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
 
-          # ---------- 关键修复：不用硬编码文件名，自动匹配脚本 ----------
-          echo "Listing .github/scripts/ with hexdump to detect invisible chars:"
-          ls -la .github/scripts/ | cat -A  # cat -A 显示所有不可见字符（比如 ^M 就是 \r）
-          
-          # 自动查找包含 global 和 mapping 的 python 脚本（兼容文件名带不可见字符的情况）
+          # 自动查找包含 global 和 mapping 的 python 脚本
           SCRIPT_PATH=$(find .github/scripts -maxdepth 1 -type f -name "*global*mapping*.py" -print -quit)
           
           if [ -z "$SCRIPT_PATH" ]; then
@@ -69,7 +65,6 @@ jobs:
           fi
           
           echo "✅ Found script at: $SCRIPT_PATH"
-          # 验证文件真实存在（直接访问路径，不是ls目录）
           ls -l "$SCRIPT_PATH" || { echo "❌ Script path invalid!"; exit 1; }
 
           # 缓存逻辑
@@ -94,14 +89,9 @@ jobs:
           TOTAL_FILES=$(wc -l < test_files.txt)
           echo "Found $TOTAL_FILES test files"
 
-          # ---------- 关键修复：先cd到脚本目录再执行，彻底避开路径问题 ----------
-          SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
-          SCRIPT_NAME=$(basename "$SCRIPT_PATH")
-          cd "$SCRIPT_DIR" || { echo "❌ Failed to cd to $SCRIPT_DIR"; exit 1; }
-          echo "Running script from directory: $(pwd)"
-          python "$SCRIPT_NAME"
-          # 回到工作目录
-          cd "$GITHUB_WORKSPACE"
+          # 关键修复：不切换目录，直接运行脚本
+          # 脚本会在当前目录（$GITHUB_WORKSPACE）找到 test_files.txt
+          python "$SCRIPT_PATH"
 
           # 验证结果
           if [ -s ".global_test_mapping.json" ]; then
@@ -212,7 +202,7 @@ jobs:
           echo "=========================================="
           echo "Current directory: $(pwd)"
 
-          # ---------- 关键修复：自动匹配检测脚本 ----------
+          # 自动查找检测脚本
           SCRIPT_PATH=$(find .github/scripts -maxdepth 1 -type f -name "*detect*affected*.py" -print -quit)
           if [ -z "$SCRIPT_PATH" ]; then
             echo "❌ ERROR: No detect script found, falling back to full test"
@@ -258,12 +248,8 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
           echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
 
-          # ---------- 关键修复：cd到脚本目录执行 ----------
-          SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
-          SCRIPT_NAME=$(basename "$SCRIPT_PATH")
-          cd "$SCRIPT_DIR" || { echo "❌ Failed to cd to $SCRIPT_DIR"; exit 1; }
-          python "$SCRIPT_NAME" > detection_output.txt 2>&1
-          cd "$GITHUB_WORKSPACE"
+          # 关键修复：不切换目录，直接运行脚本
+          python "$SCRIPT_PATH" > detection_output.txt 2>&1
 
           # 处理结果
           if grep -q "selected_paths=" detection_output.txt; then
@@ -408,4 +394,3 @@ jobs:
       - uses: re-actors/alls-green@release/v1
         with:
           jobs: ${{ toJSON(needs) }}
-          
