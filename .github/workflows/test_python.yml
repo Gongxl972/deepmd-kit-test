@@ -15,9 +15,215 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ==================== 新增：全局映射构建（轻量环境）====================
+  build-global-mapping:
+    name: Build Global Test Mapping
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python: ["3.10"]  # 只用3.10构建一次，映射与Python版本无关
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      # 安装最小化依赖（不安装深度学习框架）
+      - run: python -m pip install -U uv
+      - run: |
+          # 只安装必要的工具，不安装TensorFlow/PyTorch等深度学习框架
+          python -m pip install array-api-strict pytest-split
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: 3.5
+
+      - name: Restore global mapping cache
+        uses: actions/cache@v5
+        with:
+          path: .global_test_mapping.json
+          key: global-test-mapping-${{ github.sha }}
+          restore-keys: |
+            global-test-mapping-
+
+      - name: Build global test mapping (Safe Mode)
+        run: |
+          set -x
+          echo "=========================================="
+          echo "🔨 BUILDING GLOBAL TEST MAPPING (SAFE MODE)"
+          echo "=========================================="
+          
+          # 如果缓存中有映射文件，直接使用
+          if [ -f ".global_test_mapping.json" ] && [ -s ".global_test_mapping.json" ]; then
+            echo "✅ Using cached global mapping"
+            python -c '
+            import json
+            with open(".global_test_mapping.json", "r") as f:
+                mapping = json.load(f)
+            print(f"Cached mapping contains {len(mapping)} test files")
+            '
+            echo "=========================================="
+            echo "✅ GLOBAL MAPPING READY"
+            echo "=========================================="
+            exit 0
+          fi
+          
+          echo "🆕 Building fresh global mapping..."
+          
+          # 方法1：使用find命令收集测试文件（永不触发段错误）
+          echo "📁 Collecting test files using find..."
+          find source/tests -name "test_*.py" -type f > test_files.txt || true
+          
+          # 验证收集结果
+          if [ ! -s "test_files.txt" ]; then
+            echo "❌ ERROR: No test files collected!"
+            echo "{}" > .global_test_mapping.json
+            exit 1
+          fi
+          
+          TOTAL_FILES=$(wc -l < test_files.txt)
+          echo "Found $TOTAL_FILES test files"
+          
+          # 构建全局映射（带超时保护和重试）
+          MAX_RETRIES=3
+          RETRY_DELAY=10
+          
+          for ((retry=1; retry<=MAX_RETRIES; retry++)); do
+            echo "Attempt $retry of $MAX_RETRIES..."
+            
+            # 使用timeout命令限制整体执行时间（10分钟）
+            timeout 600 python -c '
+            import json
+            import sys
+            import os
+            import ast
+            import time
+            
+            print(f"Starting AST parsing at {time.strftime('%H:%M:%S')}")
+            start_time = time.time()
+            
+            mapping = {}
+            processed = 0
+            
+            with open("test_files.txt") as f:
+                test_files = [line.strip() for line in f if line.strip()]
+            
+            for test_file in test_files:
+                processed += 1
+                if processed % 100 == 0:
+                    elapsed = time.time() - start_time
+                    print(f"Processed {processed}/{len(test_files)} files ({elapsed:.1f}s)")
+                
+                if not os.path.exists(test_file):
+                    continue
+                
+                mapping[test_file] = {
+                    "dependencies": [],
+                    "test_functions": []
+                }
+                
+                try:
+                    with open(test_file, "r") as f:
+                        content = f.read()
+                    
+                    # 跳过过大的文件（防止内存问题）
+                    if len(content) > 1024000:  # 1MB限制
+                        print(f"Skipping large file: {test_file} ({len(content)} bytes)")
+                        continue
+                    
+                    tree = ast.parse(content)
+                    
+                    for node in ast.walk(tree):
+                        # 收集测试函数
+                        if isinstance(node, ast.FunctionDef):
+                            if node.name.startswith("test_"):
+                                mapping[test_file]["test_functions"].append(node.name)
+                        
+                        # 收集import deepmd.*
+                        if isinstance(node, ast.Import):
+                            for alias in node.names:
+                                if alias.name.startswith("deepmd"):
+                                    module_path = alias.name.replace(".", "/") + ".py"
+                                    dep = "source/" + module_path
+                                    if dep not in mapping[test_file]["dependencies"]:
+                                        mapping[test_file]["dependencies"].append(dep)
+                        
+                        # 收集from deepmd.xxx import yyy
+                        elif isinstance(node, ast.ImportFrom):
+                            if node.module and node.module.startswith("deepmd"):
+                                base = node.module.replace(".", "/")
+                                if node.names:
+                                    for alias in node.names:
+                                        if alias.name == "*":
+                                            dep = f"source/{base}.py"
+                                        else:
+                                            dep = f"source/{base}/{alias.name}.py"
+                                        # 如果文件不存在，尝试__init__.py
+                                        if not os.path.exists(dep):
+                                            dep = f"source/{base}.py"
+                                        if dep not in mapping[test_file]["dependencies"]:
+                                            mapping[test_file]["dependencies"].append(dep)
+                except SyntaxError as e:
+                    print(f"SyntaxError in {test_file}: {e}", file=sys.stderr)
+                    continue
+                except MemoryError:
+                    print(f"MemoryError processing {test_file}, skipping", file=sys.stderr)
+                    continue
+                except Exception as e:
+                    print(f"Error parsing {test_file}: {e}", file=sys.stderr)
+                    continue
+            
+            # 保存全局映射
+            with open(".global_test_mapping.json", "w") as f:
+                json.dump(mapping, f, indent=2, sort_keys=True)
+            
+            elapsed = time.time() - start_time
+            print(f"✅ Built global mapping with {len(mapping)} test files in {elapsed:.1f}s")
+            ' && {
+              # 验证映射文件
+              if [ -s ".global_test_mapping.json" ]; then
+                echo "✅ Mapping built successfully"
+                python -c '
+                import json
+                with open(".global_test_mapping.json", "r") as f:
+                    mapping = json.load(f)
+                print(f"Final mapping contains {len(mapping)} test files")
+                '
+                echo "=========================================="
+                echo "✅ GLOBAL MAPPING READY"
+                echo "=========================================="
+                exit 0
+              else
+                echo "❌ ERROR: Mapping file is empty!"
+              fi
+            } || {
+              echo "❌ Attempt $retry failed!"
+              if [ $retry -lt $MAX_RETRIES ]; then
+                echo "Waiting ${RETRY_DELAY}s before retry..."
+                sleep $RETRY_DELAY
+              fi
+            }
+          done
+          
+          # 所有重试都失败，创建空映射但记录错误
+          echo "❌ ERROR: Failed to build global mapping after $MAX_RETRIES attempts!"
+          echo "Creating empty mapping as fallback..."
+          echo "{}" > .global_test_mapping.json
+          exit 1
+
+      - name: Upload global mapping artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: global-test-mapping
+          path: .global_test_mapping.json
+          include-hidden-files: true
+
+  # ==================== 主测试作业（完整环境）====================
   testpython:
     name: Test Python
     runs-on: ubuntu-22.04
+    needs: build-global-mapping  # 依赖全局映射构建
     strategy:
       fail-fast: false
       matrix:
@@ -38,7 +244,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # 安装依赖
+      # 安装依赖（完整环境，包含深度学习框架）
       - run: python -m pip install -U uv
 
       - run: |
@@ -57,15 +263,12 @@ jobs:
           HOROVOD_WITH_MPI: 1
           CMAKE_POLICY_VERSION_MINIMUM: 3.5
 
-      # ==================== 恢复全局测试映射缓存 ====================
-      - name: Restore global test mapping cache
-        uses: actions/cache@v5
+      # ==================== 下载预构建的全局映射 ====================
+      - name: Download global mapping
+        uses: actions/download-artifact@v8
         with:
-          path: .global_test_mapping_${{ matrix.python }}.json
-          # 使用更精确的缓存key，包含分支信息避免跨分支污染
-          key: global-test-mapping-${{ matrix.python }}-${{ github.ref_name }}-${{ github.sha }}
-          restore-keys: |
-            global-test-mapping-${{ matrix.python }}-${{ github.ref_name }}-
+          name: global-test-mapping
+          path: .
 
       # ==================== 恢复失败测试缓存 ====================
       - name: Restore failed tests cache
@@ -76,130 +279,39 @@ jobs:
           restore-keys: |
             failed-tests-${{ matrix.python }}-${{ matrix.group }}-
 
-      # ==================== 收集当前group的测试映射 ====================
-      - name: Collect test mapping for current group
-        id: collect_mapping
-        continue-on-error: true  # 允许失败但不停止流程
+      # ==================== 收集当前group的测试文件（不解析依赖） ====================
+      - name: Collect test files for current group
+        id: collect_group
         run: |
           set -x
           echo "=========================================="
-          echo "📊 COLLECTING TEST MAPPING FOR GROUP ${{ matrix.group }}"
+          echo "📊 COLLECTING TEST FILES FOR GROUP ${{ matrix.group }}"
           echo "=========================================="
           
-          MAPPING_FILE=".group_mapping_${{ matrix.python }}_${{ matrix.group }}.json"
-          echo "mapping_file=$MAPPING_FILE" >> $GITHUB_OUTPUT
-          
-          # 关键修复：清除旧的映射文件，避免缓存污染
-          rm -f .global_test_mapping_${{ matrix.python }}.json "$MAPPING_FILE"
-          
-          # 如果全局映射不存在，创建空文件
-          GLOBAL_MAPPING=".global_test_mapping_${{ matrix.python }}.json"
-          if [ ! -f "$GLOBAL_MAPPING" ]; then
-            echo "{}" > "$GLOBAL_MAPPING"
-          fi
-          
-          # 使用pytest --collect-only收集当前group的测试信息
-          # 关键修复：增加超时保护，简化命令
-          timeout 180 pytest --collect-only -q \
+          # 使用pytest收集当前group的测试文件（带更长超时）
+          timeout 300 pytest --collect-only -q \
             --splits 12 \
             --group ${{ matrix.group }} \
             source/tests/ \
             --disable-warnings \
             > collected_modules.txt || true
           
-          # 提取测试文件路径（格式：<Module path/to/test.py>）
+          # 提取测试文件路径
           grep -oP '(?<=<Module ).*?(?=>)' collected_modules.txt | sort -u > test_files.txt || true
           
-          # 如果没有收集到任何测试文件，直接退出
-          if [ ! -s test_files.txt ]; then
-            echo "⚠️ No test files collected, creating empty mapping"
-            echo "{}" > "$MAPPING_FILE"
-            echo "collection_status=empty" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          echo "Collected test files for group ${{ matrix.group }}:"
-          cat test_files.txt
-          
-          # 简化版AST解析：只记录import关系
-          python -c '
-          import json
-          import sys
-          import os
-          import ast
-          
-          mapping = {}
-          
-          with open("test_files.txt") as f:
-              test_files = [line.strip() for line in f if line.strip()]
-          
-          for test_file in test_files:
-              if not os.path.exists(test_file):
-                  continue
-              
-              mapping[test_file] = {
-                  "dependencies": [],
-                  "test_functions": []
-              }
-              
-              try:
-                  with open(test_file, "r") as f:
-                      content = f.read()
-                  tree = ast.parse(content)
-                  
-                  for node in ast.walk(tree):
-                      # 收集测试函数
-                      if isinstance(node, ast.FunctionDef):
-                          if node.name.startswith("test_"):
-                              mapping[test_file]["test_functions"].append(node.name)
-                      
-                      # 收集import deepmd.*
-                      if isinstance(node, ast.Import):
-                          for alias in node.names:
-                              if alias.name.startswith("deepmd"):
-                                  # deepmd.dpmodel.xxx -> source/deepmd/dpmodel/xxx.py
-                                  module_path = alias.name.replace(".", "/") + ".py"
-                                  dep = "source/" + module_path
-                                  if dep not in mapping[test_file]["dependencies"]:
-                                      mapping[test_file]["dependencies"].append(dep)
-                      
-                      # 收集from deepmd.xxx import yyy
-                      elif isinstance(node, ast.ImportFrom):
-                          if node.module and node.module.startswith("deepmd"):
-                              base = node.module.replace(".", "/")
-                              if node.names:
-                                  for alias in node.names:
-                                      if alias.name == "*":
-                                          dep = f"source/{base}.py"
-                                      else:
-                                          dep = f"source/{base}/{alias.name}.py"
-                                      # 如果文件不存在，尝试__init__.py
-                                      if not os.path.exists(dep):
-                                          dep = f"source/{base}.py"
-                                      if dep not in mapping[test_file]["dependencies"]:
-                                          mapping[test_file]["dependencies"].append(dep)
-              except SyntaxError:
-                  print(f"SyntaxError in {test_file}", file=sys.stderr)
-                  continue
-              except Exception as e:
-                  print(f"Error parsing {test_file}: {e}", file=sys.stderr)
-                  continue
-          
-          # 保存映射
-          with open("'"$MAPPING_FILE"'", "w") as f:
-              json.dump(mapping, f, indent=2, sort_keys=True)
-          
-          print(f"✅ Saved mapping with {len(mapping)} test files")
-          '
-          
-          # 验证映射文件是否有效
-          if [ -s "$MAPPING_FILE" ]; then
-            echo "collection_status=success" >> $GITHUB_OUTPUT
+          if [ ! -s "test_files.txt" ]; then
+            echo "⚠️ No test files collected for group ${{ matrix.group }}"
+            echo "group_test_files=" >> $GITHUB_OUTPUT
           else
-            echo "collection_status=failed" >> $GITHUB_OUTPUT
-            echo "{}" > "$MAPPING_FILE"
+            echo "Collected test files for group ${{ matrix.group }}:"
+            cat test_files.txt
+            # 将测试文件列表保存到输出变量
+            echo "group_test_files=$(cat test_files.txt | tr '\n' ' ')" >> $GITHUB_OUTPUT
           fi
-        shell: bash
+          
+          echo "=========================================="
+          echo "✅ TEST FILES COLLECTION COMPLETE"
+          echo "=========================================="
 
       # ==================== 基于全局测试映射的精准测试选择 ====================
       - name: Detect affected tests using global mapping
@@ -210,61 +322,21 @@ jobs:
           echo "🔍 STARTING AFFECTED TESTS DETECTION (GLOBAL MAPPING)"
           echo "=========================================="
           
-          GLOBAL_MAPPING=".global_test_mapping_${{ matrix.python }}.json"
-          GROUP_MAPPING="${{ steps.collect_mapping.outputs.mapping_file }}"
-          
-          # 如果全局映射不存在或为空，创建一个空的
-          if [ ! -f "$GLOBAL_MAPPING" ] || [ ! -s "$GLOBAL_MAPPING" ]; then
-            echo "{}" > "$GLOBAL_MAPPING"
-            echo "ℹ️ Created empty global mapping"
+          # 验证全局映射文件
+          if [ ! -f ".global_test_mapping.json" ] || [ ! -s ".global_test_mapping.json" ]; then
+            echo "❌ ERROR: Global mapping file not found or empty!"
+            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+            echo "skip_all=false" >> $GITHUB_OUTPUT
+            echo "need_full_test=true" >> $GITHUB_OUTPUT
+            exit 1
           fi
           
-          # 合并当前group的映射到全局映射（临时，用于本次检测）
-          MERGED_MAPPING="/tmp/merged_mapping_${{ matrix.python }}.json"
-          
+          echo "✅ Global mapping file loaded"
           python -c '
           import json
-          import sys
-          import os
-          
-          global_mapping_file = "'"$GLOBAL_MAPPING"'"
-          group_mapping_file = "'"$GROUP_MAPPING"'"
-          merged_mapping_file = "'"$MERGED_MAPPING"'"
-          
-          # 加载全局映射
-          with open(global_mapping_file, "r") as f:
-              global_mapping = json.load(f)
-          
-          # 加载当前group的映射
-          if group_mapping_file and os.path.exists(group_mapping_file):
-              with open(group_mapping_file, "r") as f:
-                  group_mapping = json.load(f)
-              
-              # 合并：group映射覆盖全局映射中的相同键
-              for test_file, info in group_mapping.items():
-                  if test_file in global_mapping:
-                      # 合并依赖列表
-                      existing_deps = set(global_mapping[test_file].get("dependencies", []))
-                      new_deps = set(info.get("dependencies", []))
-                      merged_deps = existing_deps.union(new_deps)
-                      
-                      # 合并测试函数列表
-                      existing_funcs = set(global_mapping[test_file].get("test_functions", []))
-                      new_funcs = set(info.get("test_functions", []))
-                      merged_funcs = existing_funcs.union(new_funcs)
-                      
-                      global_mapping[test_file] = {
-                          "dependencies": sorted(list(merged_deps)),
-                          "test_functions": sorted(list(merged_funcs))
-                      }
-                  else:
-                      global_mapping[test_file] = info
-          
-          # 保存合并后的映射
-          with open(merged_mapping_file, "w") as f:
-              json.dump(global_mapping, f, indent=2, sort_keys=True)
-          
-          print(f"Merged mapping has {len(global_mapping)} test files")
+          with open(".global_test_mapping.json", "r") as f:
+              mapping = json.load(f)
+          print(f"Global mapping contains {len(mapping)} test files")
           '
           
           # 根据事件类型确定Base SHA
@@ -300,114 +372,100 @@ jobs:
           echo "✅ CHANGED FILES DETECTED:"
           echo "$CHANGED_FILES"
           
-          # 使用合并后的映射文件查找受影响的测试
+          # 使用全局映射查找受影响的测试
           AFFECTED_TESTS=""
           MATCHED_FILES=0
           UNMATCHED_FILES=0
           NEW_FILES=0
           NEED_FULL_TEST=false
           
-          # 遍历每个变更文件
-          while IFS= read -r changed_file; do
-            if [[ -z "$changed_file" ]]; then
-              continue
-            fi
-            
-            echo "Processing changed file: $changed_file"
-            
-            # 检查文件是否是新添加的（在BASE_SHA中不存在）
-            if git cat-file -e $BASE_SHA:"$changed_file" 2>/dev/null; then
-              echo "  ℹ️ File exists in base branch (modified)"
-              IS_NEW_FILE=false
-            else
-              echo "  🆕 File is newly added in this PR"
-              IS_NEW_FILE=true
-              NEW_FILES=$((NEW_FILES + 1))
-            fi
-            
-            # 规范化文件路径
-            NORMALIZED_FILE="$changed_file"
-            if [[ "$changed_file" == source/deepmd/* ]]; then
-              NORMALIZED_FILE="$changed_file"
-            elif [[ "$changed_file" == deepmd/* ]]; then
-              NORMALIZED_FILE="source/$changed_file"
-            fi
-            
-            # 在合并后的映射文件中查找依赖此文件的测试
-            MATCHING_TESTS=$(python -c "
+          # 加载全局映射
+          python -c '
           import json
           import sys
+          import subprocess
           
-          mapping_file = '$MERGED_MAPPING'
-          target_file = '$NORMALIZED_FILE'
+          with open(".global_test_mapping.json", "r") as f:
+              GLOBAL_MAPPING = json.load(f)
           
-          with open(mapping_file, 'r') as f:
-              mapping = json.load(f)
-          
-          matched_tests = []
-          for test_file, info in mapping.items():
-              deps = info.get('dependencies', [])
-              if any(target_file in dep or dep in target_file for dep in deps):
-                  matched_tests.append(test_file)
-          
-          print('\n'.join(matched_tests))
-          ")
-            
-            if [ -n "$MATCHING_TESTS" ]; then
-              echo "  ✅ Found matching tests:"
-              echo "$MATCHING_TESTS" | while read -r test_file; do
-                echo "    - $test_file"
-                AFFECTED_TESTS="$AFFECTED_TESTS $test_file"
-              done
-              MATCHED_FILES=$((MATCHED_FILES + 1))
-            else
-              echo "  ❌ No tests found depending on $NORMALIZED_FILE"
-              UNMATCHED_FILES=$((UNMATCHED_FILES + 1))
+          changed_files = """'"$CHANGED_FILES"'"""
+          for changed_file in changed_files.strip().split("\n"):
+              if not changed_file:
+                  continue
               
-              # 如果是新添加的文件且没有匹配的测试，需要全量测试
-              if [ "$IS_NEW_FILE" = true ]; then
-                echo "  ⚠️ New file without test coverage - will trigger full test"
-                NEED_FULL_TEST=true
-              fi
-            fi
-          done <<< "$CHANGED_FILES"
+              print(f"Processing changed file: {changed_file}")
+              
+              # 检查文件是否是新添加的
+              result = subprocess.run(["git", "cat-file", "-e", "'"$BASE_SHA"'":changed_file], 
+                                     capture_output=True, text=True)
+              is_new_file = (result.returncode != 0)
+              
+              if is_new_file:
+                  print(f"  🆕 File is newly added in this PR")
+                  NEW_FILES += 1
+                  if changed_file.startswith("source/deepmd/"):
+                      print(f"  ⚠️ New source file without test coverage - will trigger full test")
+                      NEED_FULL_TEST = True
+                  continue
+              else:
+                  print(f"  ℹ️ File exists in base branch (modified)")
+              
+              # 规范化文件路径
+              normalized_file = changed_file
+              if changed_file.startswith("deepmd/"):
+                  normalized_file = "source/" + changed_file
+              
+              # 在全局映射中查找依赖此文件的测试
+              matching_tests = []
+              for test_file, info in GLOBAL_MAPPING.items():
+                  deps = info.get("dependencies", [])
+                  if any(normalized_file in dep or dep in normalized_file for dep in deps):
+                      matching_tests.append(test_file)
+              
+              if matching_tests:
+                  print(f"  ✅ Found {len(matching_tests)} matching tests:")
+                  for test_file in matching_tests:
+                      print(f"    - {test_file}")
+                      AFFECTED_TESTS += " " + test_file
+                  MATCHED_FILES += 1
+              else:
+                  print(f"  ❌ No tests found depending on {normalized_file}")
+                  UNMATCHED_FILES += 1
           
-          echo ""
-          echo "📊 MAPPING SUMMARY:"
-          echo "  Total changed files: $(echo "$CHANGED_FILES" | wc -l)"
-          echo "  Files with matching tests: $MATCHED_FILES"
-          echo "  Files without matches: $UNMATCHED_FILES"
-          echo "  New files added: $NEW_FILES"
-          echo ""
+          # 输出结果
+          print(f"\n📊 MAPPING SUMMARY:")
+          print(f"  Total changed files: {len(changed_files.strip().split(chr(10)))}")
+          print(f"  Files with matching tests: {MATCHED_FILES}")
+          print(f"  Files without matches: {UNMATCHED_FILES}")
+          print(f"  New files added: {NEW_FILES}")
+          print(f"  Need full test: {NEED_FULL_TEST}")
           
-          # 合并缓存的失败测试
-          FAILED_TESTS_FILE=".failed_tests_${{ matrix.python }}_${{ matrix.group }}"
-          if [ -f "$FAILED_TESTS_FILE" ]; then
-            echo "💾 Adding cached failed tests:"
-            cat "$FAILED_TESTS_FILE"
-            AFFECTED_TESTS="$AFFECTED_TESTS $(cat $FAILED_TESTS_FILE)"
-          fi
+          # 去重并排序
+          if AFFECTED_TESTS:
+              AFFECTED_TESTS = " ".join(sorted(set(AFFECTED_TESTS.split())))
+              print(f"\n🎯 AFFECTED TESTS: {AFFECTED_TESTS}")
           
-          # 决定是否需要全量测试
-          if [ "$NEED_FULL_TEST" = true ] || [ -z "$AFFECTED_TESTS" ]; then
-            echo "🚨 TRIGGERING FULL TEST SUITE"
-            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
-            echo "skip_all=false" >> $GITHUB_OUTPUT
-            echo "need_full_test=true" >> $GITHUB_OUTPUT
-          else
-            echo "🎯 RUNNING INCREMENTAL TESTS ONLY"
-            # 去重并排序
-            AFFECTED_TESTS=$(echo "$AFFECTED_TESTS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-            echo "$AFFECTED_TESTS"
-            echo "selected_paths=$AFFECTED_TESTS" >> $GITHUB_OUTPUT
-            echo "skip_all=false" >> $GITHUB_OUTPUT
-            echo "need_full_test=false" >> $GITHUB_OUTPUT
-          fi
+          # 决定是否全量测试
+          if NEED_FULL_TEST or not AFFECTED_TESTS:
+              print(f"\n🚨 TRIGGERING FULL TEST SUITE")
+              print("selected_paths=source/tests")
+              print("skip_all=false")
+              print("need_full_test=true")
+          else:
+              print(f"\n🎯 RUNNING INCREMENTAL TESTS ONLY")
+              print(f"selected_paths={AFFECTED_TESTS}")
+              print("skip_all=false")
+              print("need_full_test=false")
+          ' > detection_output.txt
+          
+          # 从输出文件读取结果
+          grep "selected_paths=" detection_output.txt >> $GITHUB_OUTPUT
+          grep "skip_all=" detection_output.txt >> $GITHUB_OUTPUT
+          grep "need_full_test=" detection_output.txt >> $GITHUB_OUTPUT
           
           echo "=========================================="
           echo "✅ FINISHED AFFECTED TESTS DETECTION"
           echo "=========================================="
-        shell: bash
 
       - name: Debug affected outputs
         run: |
@@ -476,15 +534,6 @@ jobs:
           NUM_WORKERS: 0
           DP_TEST_TF2_ONLY: 1
           DP_DTYPE_PROMOTION_STRICT: 1
-
-      # ==================== 保存当前group的映射文件 ====================
-      - name: Upload group mapping artifact
-        if: always() && steps.collect_mapping.outputs.mapping_file != ''
-        uses: actions/upload-artifact@v7
-        with:
-          name: group-mapping-${{ matrix.python }}-${{ matrix.group }}
-          path: ${{ steps.collect_mapping.outputs.mapping_file }}
-          include-hidden-files: true
 
       # ==================== 保存失败测试缓存 ====================
       - name: Save failed tests cache
