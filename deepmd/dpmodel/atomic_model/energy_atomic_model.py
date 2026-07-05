@@ -13,7 +13,7 @@ from .dp_atomic_model import (
 )
 
 
-class DPEnergyAtomicModel(DPAtomicModel):
+#class DPEnergyAtomicModel(DPAtomicModel):
     def __init__(
         self, descriptor: Any, fitting: Any, type_map: list[str], **kwargs: Any
     ) -> None:
@@ -24,6 +24,4 @@ class DPEnergyAtomicModel(DPAtomicModel):
                 "fitting must be an instance of EnergyFittingNet or InvarFitting for DPEnergyAtomicModel"
             )
         super().__init__(descriptor, fitting, type_map, **kwargs)
-#test 
-def test_force_fail():
-    assert 1 == 2
+
