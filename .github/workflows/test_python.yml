@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python: ["3.10"]  # 只用3.10构建一次，映射与Python版本无关
+        python: ["3.10"]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -31,11 +31,8 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # 安装最小化依赖（不安装深度学习框架）
       - run: python -m pip install -U uv
-      - run: |
-          # 只安装必要的工具，不安装TensorFlow/PyTorch等深度学习框架
-          python -m pip install array-api-strict pytest-split jq
+      - run: python -m pip install array-api-strict pytest-split jq
         env:
           CMAKE_POLICY_VERSION_MINIMUM: 3.5
 
@@ -53,28 +50,29 @@ jobs:
           echo "=========================================="
           echo "🔨 BUILDING GLOBAL TEST MAPPING (SAFE MODE)"
           echo "=========================================="
-          echo "Current working directory: $(pwd)"
+          echo "Current directory: $(pwd)"
           echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
-          echo "Listing .github directory:"
-          ls -la .github/ || echo ".github directory not found"
-          echo "Listing .github/scripts directory:"
-          ls -la .github/scripts/ || echo ".github/scripts directory not found"
+
+          # ---------- 关键修复：不用硬编码文件名，自动匹配脚本 ----------
+          echo "Listing .github/scripts/ with hexdump to detect invisible chars:"
+          ls -la .github/scripts/ | cat -A  # cat -A 显示所有不可见字符（比如 ^M 就是 \r）
           
-          # 定义脚本路径（使用绝对路径）
-          SCRIPT_PATH="$GITHUB_WORKSPACE/.github/scripts/build_global_mapping.py"
-          echo "Script path: $SCRIPT_PATH"
+          # 自动查找包含 global 和 mapping 的 python 脚本（兼容文件名带不可见字符的情况）
+          SCRIPT_PATH=$(find .github/scripts -maxdepth 1 -type f -name "*global*mapping*.py" -print -quit)
           
-          # 检查脚本是否存在
-          if [ ! -f "$SCRIPT_PATH" ]; then
-            echo "❌ ERROR: Script not found at $SCRIPT_PATH"
-            echo "Searching for script in workspace:"
-            find "$GITHUB_WORKSPACE" -name "build_global_mapping.py" -type f || echo "Script not found anywhere"
-            echo "Creating minimal fallback mapping..."
+          if [ -z "$SCRIPT_PATH" ]; then
+            echo "❌ ERROR: No global mapping script found in .github/scripts/"
+            echo "All .py files in scripts dir:"
+            find .github/scripts -name "*.py" -print
             echo "{}" > .global_test_mapping.json
             exit 1
           fi
           
-          # 如果缓存中有映射文件，直接使用
+          echo "✅ Found script at: $SCRIPT_PATH"
+          # 验证文件真实存在（直接访问路径，不是ls目录）
+          ls -l "$SCRIPT_PATH" || { echo "❌ Script path invalid!"; exit 1; }
+
+          # 缓存逻辑
           if [ -f ".global_test_mapping.json" ] && [ -s ".global_test_mapping.json" ]; then
             echo "✅ Using cached global mapping"
             echo "Cached mapping contains $(jq length .global_test_mapping.json) test files"
@@ -85,12 +83,8 @@ jobs:
           fi
           
           echo "🆕 Building fresh global mapping..."
-          
-          # 方法1：使用find命令收集测试文件（永不触发段错误）
-          echo "📁 Collecting test files using find..."
           find source/tests -name "test_*.py" -type f > test_files.txt || true
           
-          # 验证收集结果
           if [ ! -s "test_files.txt" ]; then
             echo "❌ ERROR: No test files collected!"
             echo "{}" > .global_test_mapping.json
@@ -99,12 +93,17 @@ jobs:
           
           TOTAL_FILES=$(wc -l < test_files.txt)
           echo "Found $TOTAL_FILES test files"
-          
-          # 运行Python脚本构建全局映射（使用绝对路径）
-          echo "Running script: $SCRIPT_PATH"
-          python "$SCRIPT_PATH"
-          
-          # 验证映射文件
+
+          # ---------- 关键修复：先cd到脚本目录再执行，彻底避开路径问题 ----------
+          SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+          SCRIPT_NAME=$(basename "$SCRIPT_PATH")
+          cd "$SCRIPT_DIR" || { echo "❌ Failed to cd to $SCRIPT_DIR"; exit 1; }
+          echo "Running script from directory: $(pwd)"
+          python "$SCRIPT_NAME"
+          # 回到工作目录
+          cd "$GITHUB_WORKSPACE"
+
+          # 验证结果
           if [ -s ".global_test_mapping.json" ]; then
             FILE_COUNT=$(jq length .global_test_mapping.json)
             if [ "$FILE_COUNT" -gt 0 ]; then
@@ -114,16 +113,12 @@ jobs:
               echo "✅ GLOBAL MAPPING READY"
               echo "=========================================="
               exit 0
-            else
-              echo "❌ ERROR: Mapping file is empty!"
-              echo "{}" > .global_test_mapping.json
-              exit 1
             fi
-          else
-            echo "❌ ERROR: Failed to build global mapping!"
-            echo "{}" > .global_test_mapping.json
-            exit 1
           fi
+          
+          echo "❌ ERROR: Failed to build global mapping!"
+          echo "{}" > .global_test_mapping.json
+          exit 1
 
       - name: Upload global mapping artifact
         uses: actions/upload-artifact@v7
@@ -136,7 +131,7 @@ jobs:
   testpython:
     name: Test Python
     runs-on: ubuntu-22.04
-    needs: build-global-mapping  # 依赖全局映射构建
+    needs: build-global-mapping
     strategy:
       fail-fast: false
       matrix:
@@ -157,15 +152,12 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # 安装依赖（完整环境，包含深度学习框架）
       - run: python -m pip install -U uv
-
       - run: |
           source/install/uv_with_retry.sh pip install --system openmpi --group pin_tensorflow_cpu --group pin_pytorch_cpu --torch-backend cpu
           export TENSORFLOW_ROOT=$(python -c 'import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec("tensorflow").origin).parent)')
           export PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')
           source/install/uv_with_retry.sh pip install --system -e .[test,jax,torch] mpi4py --group pin_jax_cpu
-          # 修复：安装最新的 nightly 版本，不指定具体日期
           source/install/uv_with_retry.sh pip install --system --find-links "https://www.paddlepaddle.org.cn/packages/nightly/cpu/paddlepaddle/" --index-url https://pypi.org/simple --trusted-host www.paddlepaddle.org.cn --trusted-host paddlepaddle.org.cn paddlepaddle
           python -m pip install array-api-strict pytest-split pytest-cov jq
         env:
@@ -176,14 +168,12 @@ jobs:
           HOROVOD_WITH_MPI: 1
           CMAKE_POLICY_VERSION_MINIMUM: 3.5
 
-      # ==================== 下载预构建的全局映射 ====================
       - name: Download global mapping
         uses: actions/download-artifact@v8
         with:
           name: global-test-mapping
           path: .
 
-      # ==================== 恢复失败测试缓存 ====================
       - name: Restore failed tests cache
         uses: actions/cache@v5
         with:
@@ -192,7 +182,6 @@ jobs:
           restore-keys: |
             failed-tests-${{ matrix.python }}-${{ matrix.group }}-
 
-      # ==================== 收集当前group的测试文件（不解析依赖） ====================
       - name: Collect test files for current group
         id: collect_group
         run: |
@@ -200,95 +189,61 @@ jobs:
           echo "=========================================="
           echo "📊 COLLECTING TEST FILES FOR GROUP ${{ matrix.group }}"
           echo "=========================================="
-          
-          # 使用pytest收集当前group的测试文件（带更长超时）
-          timeout 300 pytest --collect-only -q \
-            --splits 12 \
-            --group ${{ matrix.group }} \
-            source/tests/ \
-            --disable-warnings \
-            > collected_modules.txt || true
-          
-          # 提取测试文件路径
+          timeout 300 pytest --collect-only -q --splits 12 --group ${{ matrix.group }} source/tests/ --disable-warnings > collected_modules.txt || true
           grep -oP '(?<=<Module ).*?(?=>)' collected_modules.txt | sort -u > test_files.txt || true
-          
           if [ ! -s "test_files.txt" ]; then
             echo "⚠️ No test files collected for group ${{ matrix.group }}"
             echo "group_test_files=" >> $GITHUB_OUTPUT
           else
             echo "Collected test files for group ${{ matrix.group }}:"
             cat test_files.txt
-            # 将测试文件列表保存到输出变量
             echo "group_test_files=$(cat test_files.txt | tr '\n' ' ')" >> $GITHUB_OUTPUT
           fi
-          
           echo "=========================================="
           echo "✅ TEST FILES COLLECTION COMPLETE"
           echo "=========================================="
 
-      # ==================== 基于全局测试映射的精准测试选择 ====================
       - name: Detect affected tests using global mapping
         id: affected
         run: |
           set -x
           echo "=========================================="
-          echo "🔍 STARTING AFFECTED TESTS DETECTION (GLOBAL MAPPING)"
+          echo "🔍 STARTING AFFECTED TESTS DETECTION"
           echo "=========================================="
-          echo "Current working directory: $(pwd)"
-          echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
-          echo "Listing .github/scripts directory:"
-          ls -la .github/scripts/ || echo ".github/scripts directory not found"
-          
-          # 定义脚本路径（使用绝对路径）
-          SCRIPT_PATH="$GITHUB_WORKSPACE/.github/scripts/detect_affected_tests.py"
-          echo "Script path: $SCRIPT_PATH"
-          
-          # 检查脚本是否存在
-          if [ ! -f "$SCRIPT_PATH" ]; then
-            echo "❌ ERROR: Script not found at $SCRIPT_PATH"
-            echo "Searching for script in workspace:"
-            find "$GITHUB_WORKSPACE" -name "detect_affected_tests.py" -type f || echo "Script not found anywhere"
-            echo "Falling back to full test suite..."
+          echo "Current directory: $(pwd)"
+
+          # ---------- 关键修复：自动匹配检测脚本 ----------
+          SCRIPT_PATH=$(find .github/scripts -maxdepth 1 -type f -name "*detect*affected*.py" -print -quit)
+          if [ -z "$SCRIPT_PATH" ]; then
+            echo "❌ ERROR: No detect script found, falling back to full test"
             echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
             echo "skip_all=false" >> $GITHUB_OUTPUT
             echo "need_full_test=true" >> $GITHUB_OUTPUT
             exit 0
           fi
-          
-          # 验证全局映射文件
+          echo "✅ Found detect script at: $SCRIPT_PATH"
+          ls -l "$SCRIPT_PATH"
+
           if [ ! -f ".global_test_mapping.json" ] || [ ! -s ".global_test_mapping.json" ]; then
-            echo "❌ ERROR: Global mapping file not found or empty!"
+            echo "❌ ERROR: Global mapping missing, full test"
             echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
             echo "skip_all=false" >> $GITHUB_OUTPUT
             echo "need_full_test=true" >> $GITHUB_OUTPUT
             exit 1
           fi
-          
-          echo "✅ Global mapping file loaded"
-          echo "Global mapping contains $(jq length .global_test_mapping.json) test files"
-          
-          # 根据事件类型确定Base SHA
+
+          # Base SHA 逻辑
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          elif [[ "${{ github.event_name }}" == "push" ]]; then
-            if git show-ref --verify --quiet refs/remotes/origin/main; then
-              BASE_SHA=$(git merge-base HEAD origin/main)
-            elif git show-ref --verify --quiet refs/remotes/origin/master; then
-              BASE_SHA=$(git merge-base HEAD origin/master)
-            else
-              BASE_SHA="HEAD~1"
-            fi
+          elif git show-ref --verify --quiet refs/remotes/origin/main; then
+            BASE_SHA=$(git merge-base HEAD origin/main)
+          elif git show-ref --verify --quiet refs/remotes/origin/master; then
+            BASE_SHA=$(git merge-base HEAD origin/master)
           else
-            git fetch origin main
-            BASE_SHA="origin/main"
+            BASE_SHA="HEAD~1"
           fi
-          
-          echo "Base SHA: $BASE_SHA"
-          echo "Head SHA: ${{ github.sha }}"
-          
-          # 获取变更的文件列表
+
           CHANGED_FILES=$(git diff --name-only --diff-filter=d $BASE_SHA ${{ github.sha }})
-          
           if [ -z "$CHANGED_FILES" ]; then
             echo "❌ NO FILES CHANGED - Skipping tests"
             echo "skip_all=true" >> $GITHUB_OUTPUT
@@ -296,102 +251,63 @@ jobs:
             echo "need_full_test=false" >> $GITHUB_OUTPUT
             exit 0
           fi
-          
-          echo "✅ CHANGED FILES DETECTED:"
-          echo "$CHANGED_FILES"
-          
-          # 设置环境变量供Python脚本使用
+
+          # 设置环境变量
           echo "CHANGED_FILES<<EOF" >> $GITHUB_ENV
           echo "$CHANGED_FILES" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
-          
-          # 运行Python脚本检测受影响的测试（使用绝对路径）
-          echo "Running script: $SCRIPT_PATH"
-          python "$SCRIPT_PATH" > detection_output.txt 2>&1
-          
-          # 从输出文件读取结果并设置输出变量
+
+          # ---------- 关键修复：cd到脚本目录执行 ----------
+          SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+          SCRIPT_NAME=$(basename "$SCRIPT_PATH")
+          cd "$SCRIPT_DIR" || { echo "❌ Failed to cd to $SCRIPT_DIR"; exit 1; }
+          python "$SCRIPT_NAME" > detection_output.txt 2>&1
+          cd "$GITHUB_WORKSPACE"
+
+          # 处理结果
           if grep -q "selected_paths=" detection_output.txt; then
             grep "selected_paths=" detection_output.txt >> $GITHUB_OUTPUT
           else
             echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
           fi
-          
           if grep -q "skip_all=" detection_output.txt; then
             grep "skip_all=" detection_output.txt >> $GITHUB_OUTPUT
           else
             echo "skip_all=false" >> $GITHUB_OUTPUT
           fi
-          
           if grep -q "need_full_test=" detection_output.txt; then
             grep "need_full_test=" detection_output.txt >> $GITHUB_OUTPUT
           else
             echo "need_full_test=true" >> $GITHUB_OUTPUT
           fi
-          
           echo "=========================================="
           echo "✅ FINISHED AFFECTED TESTS DETECTION"
           echo "=========================================="
 
       - name: Debug affected outputs
         run: |
-          echo "Debugging affected step outputs:"
           echo "skip_all: ${{ steps.affected.outputs.skip_all }}"
           echo "selected_paths: ${{ steps.affected.outputs.selected_paths }}"
           echo "need_full_test: ${{ steps.affected.outputs.need_full_test }}"
-          echo "Is selected_paths empty? ${{ steps.affected.outputs.selected_paths == '' }}"
 
       - name: Check if should skip
         id: step_check_skip
-        run: |
-          echo "Check if should skip:"
-          echo "skip_all=${{ steps.affected.outputs.skip_all }}"
-          echo "selected_paths=${{ steps.affected.outputs.selected_paths }}"
-          echo "need_full_test=${{ steps.affected.outputs.need_full_test }}"
-          echo "skip_all=${{ steps.affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
+        run: echo "skip_all=${{ steps.affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
 
-      # 运行测试（基于选中的路径）
       - name: Run tests via pytest
         if: steps.step_check_skip.outputs.skip_all != 'true'
         timeout-minutes: 180
         run: |
-          echo "🚀 STARTING PYTEST WITH GLOBAL MAPPING-BASED SELECTION"
-          echo "============================================="
-          
+          echo "🚀 STARTING PYTEST"
           SELECTED_PATHS="${{ steps.affected.outputs.selected_paths }}"
-          echo "Selected test paths: $SELECTED_PATHS"
-          echo ""
-          
-          PATH_COUNT=$(echo "$SELECTED_PATHS" | wc -w)
-          echo "Number of test paths: $PATH_COUNT"
-          echo ""
-          
-          if [[ "$SELECTED_PATHS" == "source/tests" ]]; then
-            echo "⚠️ WARNING: Running FULL TEST SUITE"
-            if [[ "${{ steps.affected.outputs.need_full_test }}" == "true" ]]; then
-              echo "Reason: New source file(s) detected without test coverage"
-            fi
-          else
-            echo "✅ Running incremental tests only"
-          fi
-          echo ""
-          
-          pytest -vv --cov=deepmd $SELECTED_PATHS \
-            --splits 12 --group ${{ matrix.group }} \
-            --store-durations --clean-durations \
-            --durations-path=.test_durations \
-            --splitting-algorithm least_duration \
-            --disable-warnings || true
+          echo "Selected paths: $SELECTED_PATHS"
+          pytest -vv --cov=deepmd $SELECTED_PATHS --splits 12 --group ${{ matrix.group }} --store-durations --clean-durations --durations-path=.test_durations --splitting-algorithm least_duration --disable-warnings || true
         env:
           NUM_WORKERS: 0
           DP_CI_IMPORT_PADDLE_BEFORE_TF: 1
           FLAGS_use_stride_compute_kernel: 0
 
-      - name: Skipped tests notification
-        if: steps.step_check_skip.outputs.skip_all == 'true'
-        run: echo "✅ No changes and no prior failures. All tests skipped."
-
-      # TF2 Eager 测试
       - name: Test TF2 eager mode
         if: matrix.group == 1 && steps.step_check_skip.outputs.skip_all != 'true'
         timeout-minutes: 20
@@ -401,27 +317,17 @@ jobs:
           DP_TEST_TF2_ONLY: 1
           DP_DTYPE_PROMOTION_STRICT: 1
 
-      # ==================== 保存失败测试缓存 ====================
       - name: Save failed tests cache
         if: always()
         run: |
-          echo "💾 SAVING FAILED TESTS CACHE"
-          echo "============================="
-          
           FAILED_TESTS_FILE=".failed_tests_${{ matrix.python }}_${{ matrix.group }}"
-          
           if grep -q "FAILED" .test_durations; then
-            echo "❌ FAILED TESTS DETECTED"
             grep "FAILED" .test_durations | sed 's/.*FAILED //' | sed 's/::.*//' | sort -u > "$FAILED_TESTS_FILE"
-            echo "Failed tests saved:"
-            cat "$FAILED_TESTS_FILE"
+            echo "Saved failed tests to $FAILED_TESTS_FILE"
           else
-            echo "✅ NO FAILED TESTS FOUND"
             rm -f "$FAILED_TESTS_FILE"
           fi
-        shell: bash
 
-      # 保存测试持续时间数据
       - run: mv .test_durations .test_durations_${{ matrix.group }}
 
       - name: Upload partial durations
@@ -431,7 +337,7 @@ jobs:
           path: .test_durations_${{ matrix.python }}.json
           include-hidden-files: true
 
-      - name: Upload coverage to Codecov (non-blocking)
+      - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
         continue-on-error: true
         with:
@@ -447,73 +353,24 @@ jobs:
     needs: testpython
     steps:
       - uses: actions/checkout@v6
-      
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
-          
       - name: Download all group mappings
         uses: actions/download-artifact@v8
         with:
           pattern: group-mapping-${{ matrix.python }}-*
           merge-multiple: true
-          
       - name: Merge mappings into global mapping
         run: |
           set -x
-          echo "🔄 MERGING ALL GROUP MAPPINGS INTO GLOBAL MAPPING"
-          echo "=================================================="
-          
           GLOBAL_MAPPING=".global_test_mapping_${{ matrix.python }}.json"
-          
-          # 初始化全局映射
-          if [ -f "$GLOBAL_MAPPING" ]; then
-            echo "Loading existing global mapping"
-          else
-            echo "{}" > "$GLOBAL_MAPPING"
-          fi
-          
-          # 使用jq合并所有group映射文件
-          # 收集所有JSON文件
+          echo "{}" > "$GLOBAL_MAPPING"
           ALL_JSON_FILES=("$GLOBAL_MAPPING" .group_mapping_*.json)
-          
           if [ ${#ALL_JSON_FILES[@]} -gt 1 ]; then
-            # 使用jq合并所有文件
-            jq -s 'reduce .[] as $item ({}; 
-              . * $item | 
-              with_entries(
-                .value.dependencies = (.value.dependencies // [] | unique | sort) |
-                .value.test_functions = (.value.test_functions // [] | unique | sort)
-              )
-            )' "${ALL_JSON_FILES[@]}" > "$GLOBAL_MAPPING.tmp" && mv "$GLOBAL_MAPPING.tmp" "$GLOBAL_MAPPING"
-            
-            echo "✅ Global mapping now contains $(jq length "$GLOBAL_MAPPING") test files"
-            
-            # 显示统计信息
-            TOTAL_DEPS=$(jq '[.[] | .dependencies // []] | flatten | length' "$GLOBAL_MAPPING")
-            AVG_DEPS=$(jq '[.[] | .dependencies // []] | flatten | length as $total | if $total > 0 then ($total / length) else 0 end' "$GLOBAL_MAPPING")
-            echo "📊 STATISTICS:"
-            echo "  Total test files: $(jq length "$GLOBAL_MAPPING")"
-            echo "  Total dependencies tracked: $TOTAL_DEPS"
-            echo "  Average dependencies per test: $AVG_DEPS"
-          else
-            echo "No additional mapping files to merge."
+            jq -s 'reduce .[] as $item ({}; . * $item | with_entries(.value.dependencies |= (._ // [] | unique | sort) | .value.test_functions |= (._ // [] | unique | sort)))' "${ALL_JSON_FILES[@]}" > "$GLOBAL_MAPPING.tmp" && mv "$GLOBAL_MAPPING.tmp" "$GLOBAL_MAPPING"
+            echo "✅ Merged, total files: $(jq length "$GLOBAL_MAPPING")"
           fi
-          
-          echo "=================================================="
-          echo "✅ MERGE COMPLETED"
-          echo "=================================================="
-        shell: bash
-        
-      - name: Save global mapping cache
-        uses: actions/cache@v5
-        with:
-          path: .global_test_mapping_${{ matrix.python }}.json
-          # 使用更精确的缓存key，包含分支信息
-          key: global-test-mapping-${{ matrix.python }}-${{ github.ref_name }}-${{ github.sha }}
-          restore-keys: |
-            global-test-mapping-${{ matrix.python }}-${{ github.ref_name }}-
-        
       - name: Upload global mapping artifact
         uses: actions/upload-artifact@v7
         with:
@@ -525,7 +382,6 @@ jobs:
     name: Combine and update integration test durations
     runs-on: ubuntu-22.04
     strategy:
-      fail-fast: false
       matrix:
         python: ["3.10", "3.13"]
     needs: [testpython, merge_mappings]
@@ -536,15 +392,12 @@ jobs:
           path: .test_durations
           key: test2-durations-combined-${{ matrix.python }}-${{ github.sha }}
           restore-keys: test2-durations-combined-${{ matrix.python }}
-
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
           pattern: split-${{ matrix.python }}-*
           merge-multiple: true
-
-      - name: Combine test durations
-        run: jq -s add .test_durations_* > .test_durations
+      - run: jq -s add .test_durations_* > .test_durations
 
   pass:
     name: Pass testing Python
@@ -552,7 +405,7 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - name: Decide whether the needed jobs succeeded or failed
-        uses: re-actors/alls-green@release/v1
+      - uses: re-actors/alls-green@release/v1
         with:
           jobs: ${{ toJSON(needs) }}
+          
