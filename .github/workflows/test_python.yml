@@ -46,7 +46,8 @@ jobs:
           export TENSORFLOW_ROOT=$(python -c 'import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec("tensorflow").origin).parent)')
           export PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')
           source/install/uv_with_retry.sh pip install --system -e .[test,jax,torch] mpi4py --group pin_jax_cpu
-          source/install/uv_with_retry.sh pip install --system --find-links "https://www.paddlepaddle.org.cn/packages/nightly/cpu/paddlepaddle/" --index-url https://pypi.org/simple --trusted-host www.paddlepaddle.org.cn --trusted-host paddlepaddle.org.cn paddlepaddle==3.4.0.dev20250310
+          # 修复：安装最新的 nightly 版本，不指定具体日期
+          source/install/uv_with_retry.sh pip install --system --find-links "https://www.paddlepaddle.org.cn/packages/nightly/cpu/paddlepaddle/" --index-url https://pypi.org/simple --trusted-host www.paddlepaddle.org.cn --trusted-host paddlepaddle.org.cn paddlepaddle
           python -m pip install array-api-strict pytest-split pytest-cov
         env:
           DP_ENABLE_PYTORCH: 1
@@ -77,6 +78,7 @@ jobs:
       # ==================== 收集当前group的测试映射 ====================
       - name: Collect test mapping for current group
         id: collect_mapping
+        continue-on-error: true  # 允许失败但不停止流程
         run: |
           set -x
           echo "=========================================="
@@ -84,9 +86,15 @@ jobs:
           echo "=========================================="
           
           MAPPING_FILE=".group_mapping_${{ matrix.python }}_${{ matrix.group }}.json"
+          echo "mapping_file=$MAPPING_FILE" >> $GITHUB_OUTPUT
+          
+          # 如果全局映射不存在，创建空文件
+          GLOBAL_MAPPING=".global_test_mapping_${{ matrix.python }}.json"
+          if [ ! -f "$GLOBAL_MAPPING" ]; then
+            echo "{}" > "$GLOBAL_MAPPING"
+          fi
           
           # 使用pytest --collect-only收集当前group的测试信息
-          # 注意：我们需要收集但不运行测试
           python -c '
           import json
           import sys
@@ -94,12 +102,12 @@ jobs:
           import os
           import subprocess
           
-          GROUP_ID = "${{ matrix.group }}"
+          GROUP_ID = "'"${{ matrix.group }}"'"
           TOTAL_GROUPS = 12
           MAPPING_FILE = "'"$MAPPING_FILE"'"
+          GLOBAL_MAPPING_FILE = "'"$GLOBAL_MAPPING"'"
           
           # 首先获取当前group要运行的测试文件列表
-          # 使用pytest --collect-only 和 --splits/--group 参数
           cmd = [
               "pytest",
               "--collect-only",
@@ -110,7 +118,18 @@ jobs:
               "--disable-warnings"
           ]
           
-          result = subprocess.run(cmd, capture_output=True, text=True)
+          try:
+              result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+          except subprocess.TimeoutExpired:
+              print("⚠️ pytest --collect-only timed out, creating empty mapping")
+              with open(MAPPING_FILE, "w") as f:
+                  json.dump({}, f)
+              sys.exit(0)
+          except Exception as e:
+              print(f"⚠️ Failed to run pytest --collect-only: {e}")
+              with open(MAPPING_FILE, "w") as f:
+                  json.dump({}, f)
+              sys.exit(0)
           
           # 解析pytest输出，提取测试文件路径
           test_files = set()
@@ -119,7 +138,6 @@ jobs:
               if line.startswith("source/tests/") and line.endswith(".py"):
                   test_files.add(line.split("::")[0])
               elif "<Module" in line:
-                  # 另一种格式: <Module source/tests/test_something.py>
                   import re
                   match = re.search(r"<Module\s+(.+?)>", line)
                   if match:
@@ -154,17 +172,14 @@ jobs:
                       if isinstance(node, ast.Import):
                           for alias in node.names:
                               if alias.name.startswith("deepmd"):
-                                  # 转换为文件路径
                                   module_path = alias.name.replace(".", "/") + ".py"
                                   if module_path.startswith("deepmd/"):
                                       mapping[rel_path]["dependencies"].add("source/" + module_path)
                       elif isinstance(node, ast.ImportFrom):
                           if node.module and node.module.startswith("deepmd"):
-                              # 处理 from deepmd.xxx import yyy
                               module_parts = node.module.split(".")
                               if len(module_parts) > 1:
                                   base_module = "/".join(module_parts[:-1])
-                                  item = module_parts[-1]
                                   if node.names:
                                       for alias in node.names:
                                           if alias.name:
@@ -182,6 +197,9 @@ jobs:
                           if node.name.startswith("test_"):
                               mapping[rel_path]["test_functions"].append(node.name)
               
+              except SyntaxError:
+                  print(f"Warning: Syntax error in {test_file}, skipping")
+                  continue
               except Exception as e:
                   print(f"Warning: Failed to parse {test_file}: {e}")
                   continue
@@ -202,7 +220,7 @@ jobs:
           print(f"Total test files mapped: {len(final_mapping)}")
           '
           
-          echo "mapping_file=$MAPPING_FILE" >> $GITHUB_OUTPUT
+          echo "collection_status=success" >> $GITHUB_OUTPUT
         shell: bash
 
       # ==================== 基于全局测试映射的精准测试选择 ====================
@@ -229,6 +247,7 @@ jobs:
           python -c '
           import json
           import sys
+          import os
           
           global_mapping_file = "'"$GLOBAL_MAPPING"'"
           group_mapping_file = "'"$GROUP_MAPPING"'"
@@ -239,12 +258,29 @@ jobs:
               global_mapping = json.load(f)
           
           # 加载当前group的映射
-          if os.path.exists(group_mapping_file):
+          if group_mapping_file and os.path.exists(group_mapping_file):
               with open(group_mapping_file, "r") as f:
                   group_mapping = json.load(f)
               
               # 合并：group映射覆盖全局映射中的相同键
-              global_mapping.update(group_mapping)
+              for test_file, info in group_mapping.items():
+                  if test_file in global_mapping:
+                      # 合并依赖列表
+                      existing_deps = set(global_mapping[test_file].get("dependencies", []))
+                      new_deps = set(info.get("dependencies", []))
+                      merged_deps = existing_deps.union(new_deps)
+                      
+                      # 合并测试函数列表
+                      existing_funcs = set(global_mapping[test_file].get("test_functions", []))
+                      new_funcs = set(info.get("test_functions", []))
+                      merged_funcs = existing_funcs.union(new_funcs)
+                      
+                      global_mapping[test_file] = {
+                          "dependencies": sorted(list(merged_deps)),
+                          "test_functions": sorted(list(merged_funcs))
+                      }
+                  else:
+                      global_mapping[test_file] = info
           
           # 保存合并后的映射
           with open(merged_mapping_file, "w") as f:
@@ -279,6 +315,7 @@ jobs:
             echo "❌ NO FILES CHANGED - Running full test suite"
             echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
             echo "skip_all=false" >> $GITHUB_OUTPUT
+            echo "need_full_test=true" >> $GITHUB_OUTPUT
             exit 0
           fi
           
@@ -289,6 +326,8 @@ jobs:
           AFFECTED_TESTS=""
           MATCHED_FILES=0
           UNMATCHED_FILES=0
+          NEW_FILES=0
+          NEED_FULL_TEST=false
           
           # 遍历每个变更文件
           while IFS= read -r changed_file; do
@@ -297,6 +336,16 @@ jobs:
             fi
             
             echo "Processing changed file: $changed_file"
+            
+            # 检查文件是否是新添加的（在BASE_SHA中不存在）
+            if git cat-file -e $BASE_SHA:"$changed_file" 2>/dev/null; then
+              echo "  ℹ️ File exists in base branch (modified)"
+              IS_NEW_FILE=false
+            else
+              echo "  🆕 File is newly added in this PR"
+              IS_NEW_FILE=true
+              NEW_FILES=$((NEW_FILES + 1))
+            fi
             
             # 规范化文件路径
             NORMALIZED_FILE="$changed_file"
@@ -336,6 +385,12 @@ jobs:
             else
               echo "  ❌ No tests found depending on $NORMALIZED_FILE"
               UNMATCHED_FILES=$((UNMATCHED_FILES + 1))
+              
+              # 如果是新添加的文件且没有匹配的测试，需要全量测试
+              if [ "$IS_NEW_FILE" = true ]; then
+                echo "  ⚠️ New file without test coverage - will trigger full test"
+                NEED_FULL_TEST=true
+              fi
             fi
           done <<< "$CHANGED_FILES"
           
@@ -344,6 +399,7 @@ jobs:
           echo "  Total changed files: $(echo "$CHANGED_FILES" | wc -l)"
           echo "  Files with matching tests: $MATCHED_FILES"
           echo "  Files without matches: $UNMATCHED_FILES"
+          echo "  New files added: $NEW_FILES"
           echo ""
           
           # 合并缓存的失败测试
@@ -354,17 +410,20 @@ jobs:
             AFFECTED_TESTS="$AFFECTED_TESTS $(cat $FAILED_TESTS_FILE)"
           fi
           
-          # 去重并排序
-          if [ -n "$AFFECTED_TESTS" ]; then
+          # 决定是否需要全量测试
+          if [ "$NEED_FULL_TEST" = true ] || [ -z "$AFFECTED_TESTS" ]; then
+            echo "🚨 TRIGGERING FULL TEST SUITE"
+            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+            echo "skip_all=false" >> $GITHUB_OUTPUT
+            echo "need_full_test=true" >> $GITHUB_OUTPUT
+          else
+            echo "🎯 RUNNING INCREMENTAL TESTS ONLY"
+            # 去重并排序
             AFFECTED_TESTS=$(echo "$AFFECTED_TESTS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-            echo "🎯 FINAL AFFECTED TESTS:"
             echo "$AFFECTED_TESTS"
             echo "selected_paths=$AFFECTED_TESTS" >> $GITHUB_OUTPUT
             echo "skip_all=false" >> $GITHUB_OUTPUT
-          else
-            echo "🚨 NO AFFECTED TESTS FOUND - Running full test suite"
-            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
-            echo "skip_all=false" >> $GITHUB_OUTPUT
+            echo "need_full_test=false" >> $GITHUB_OUTPUT
           fi
           
           echo "=========================================="
@@ -377,19 +436,21 @@ jobs:
           echo "Debugging affected step outputs:"
           echo "skip_all: ${{ steps.affected.outputs.skip_all }}"
           echo "selected_paths: ${{ steps.affected.outputs.selected_paths }}"
+          echo "need_full_test: ${{ steps.affected.outputs.need_full_test }}"
           echo "Is selected_paths empty? ${{ steps.affected.outputs.selected_paths == '' }}"
 
       - name: Check if should skip
-        id: check_skip
+        id: step_check_skip
         run: |
           echo "Check if should skip:"
           echo "skip_all=${{ steps.affected.outputs.skip_all }}"
           echo "selected_paths=${{ steps.affected.outputs.selected_paths }}"
+          echo "need_full_test=${{ steps.affected.outputs.need_full_test }}"
           echo "skip_all=${{ steps.affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
 
       # 运行测试（基于选中的路径）
       - name: Run tests via pytest
-        if: steps.check_skip.outputs.skip_all != 'true'
+        if: steps.step_check_skip.outputs.skip_all != 'true'
         timeout-minutes: 180
         run: |
           echo "🚀 STARTING PYTEST WITH GLOBAL MAPPING-BASED SELECTION"
@@ -405,6 +466,9 @@ jobs:
           
           if [[ "$SELECTED_PATHS" == "source/tests" ]]; then
             echo "⚠️ WARNING: Running FULL TEST SUITE"
+            if [[ "${{ steps.affected.outputs.need_full_test }}" == "true" ]]; then
+              echo "Reason: New source file(s) detected without test coverage"
+            fi
           else
             echo "✅ Running incremental tests only"
           fi
@@ -422,12 +486,12 @@ jobs:
           FLAGS_use_stride_compute_kernel: 0
 
       - name: Skipped tests notification
-        if: steps.check_skip.outputs.skip_all == 'true'
+        if: steps.step_check_skip.outputs.skip_all == 'true'
         run: echo "✅ No changes and no prior failures. All tests skipped."
 
       # TF2 Eager 测试
       - name: Test TF2 eager mode
-        if: matrix.group == 1 && steps.check_skip.outputs.skip_all != 'true'
+        if: matrix.group == 1 && steps.step_check_skip.outputs.skip_all != 'true'
         timeout-minutes: 20
         run: pytest --cov=deepmd --cov-append source/tests/consistent/io/test_io.py source/jax2tf_tests
         env:
@@ -437,6 +501,7 @@ jobs:
 
       # ==================== 保存当前group的映射文件 ====================
       - name: Upload group mapping artifact
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: group-mapping-${{ matrix.python }}-${{ matrix.group }}
@@ -568,25 +633,27 @@ jobs:
               json.dump(global_mapping, f, indent=2, sort_keys=True)
           
           print(f"✅ Global mapping now contains {len(global_mapping)} test files")
-          '
           
           # 显示统计信息
-          python -c '
-          import json
-          with open("'"$GLOBAL_MAPPING"'", "r") as f:
-              mapping = json.load(f)
-          
-          total_deps = sum(len(info.get("dependencies", [])) for info in mapping.values())
+          total_deps = sum(len(info.get("dependencies", [])) for info in global_mapping.values())
           print(f"📊 STATISTICS:")
-          print(f"  Total test files: {len(mapping)}")
+          print(f"  Total test files: {len(global_mapping)}")
           print(f"  Total dependencies tracked: {total_deps}")
-          print(f"  Average dependencies per test: {total_deps/len(mapping) if mapping else 0:.1f}")
+          print(f"  Average dependencies per test: {total_deps/len(global_mapping) if global_mapping else 0:.1f}")
           '
           
           echo "=================================================="
           echo "✅ MERGE COMPLETED"
           echo "=================================================="
         shell: bash
+        
+      - name: Save global mapping cache
+        uses: actions/cache@v5
+        with:
+          path: .global_test_mapping_${{ matrix.python }}.json
+          key: global-test-mapping-${{ matrix.python }}-${{ github.sha }}
+          restore-keys: |
+            global-test-mapping-${{ matrix.python }}-
         
       - name: Upload global mapping artifact
         uses: actions/upload-artifact@v7
