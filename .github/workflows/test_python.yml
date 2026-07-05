@@ -31,6 +31,15 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      # 缓存uv下载的依赖，加速后续安装
+      - name: Cache uv cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('pyproject.toml', 'requirements*.txt') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ matrix.python }}-
+
       - run: python -m pip install -U uv
       - run: python -m pip install array-api-strict pytest-split jq
         env:
@@ -53,7 +62,7 @@ jobs:
           echo "Current directory: $(pwd)"
           echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
 
-          # 自动查找包含 global 和 mapping 的 python 脚本
+          # 自动查找映射构建脚本
           SCRIPT_PATH=$(find .github/scripts -maxdepth 1 -type f -name "*global*mapping*.py" -print -quit)
           
           if [ -z "$SCRIPT_PATH" ]; then
@@ -67,7 +76,7 @@ jobs:
           echo "✅ Found script at: $SCRIPT_PATH"
           ls -l "$SCRIPT_PATH" || { echo "❌ Script path invalid!"; exit 1; }
 
-          # 缓存逻辑
+          # 缓存命中逻辑
           if [ -f ".global_test_mapping.json" ] && [ -s ".global_test_mapping.json" ]; then
             echo "✅ Using cached global mapping"
             echo "Cached mapping contains $(jq length .global_test_mapping.json) test files"
@@ -89,9 +98,15 @@ jobs:
           TOTAL_FILES=$(wc -l < test_files.txt)
           echo "Found $TOTAL_FILES test files"
 
-          # 关键修复：不切换目录，直接运行脚本
-          # 脚本会在当前目录（$GITHUB_WORKSPACE）找到 test_files.txt
-          python "$SCRIPT_PATH"
+          # 关键修复：不切换目录直接运行脚本 + 添加超时保护
+          timeout 600 python "$SCRIPT_PATH" || {
+            echo "❌ Mapping script timed out or failed!"
+            echo "{}" > .global_test_mapping.json
+            exit 1
+          }
+
+          # 清理临时文件
+          rm -f test_files.txt
 
           # 验证结果
           if [ -s ".global_test_mapping.json" ]; then
@@ -142,6 +157,15 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      # 缓存uv依赖，加速安装
+      - name: Cache uv cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('pyproject.toml', 'requirements*.txt') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ matrix.python }}-
+
       - run: python -m pip install -U uv
       - run: |
           source/install/uv_with_retry.sh pip install --system openmpi --group pin_tensorflow_cpu --group pin_pytorch_cpu --torch-backend cpu
@@ -163,6 +187,8 @@ jobs:
         with:
           name: global-test-mapping
           path: .
+        # 校验下载结果
+        continue-on-error: false
 
       - name: Restore failed tests cache
         uses: actions/cache@v5
@@ -248,8 +274,16 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
           echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
 
-          # 关键修复：不切换目录，直接运行脚本
-          python "$SCRIPT_PATH" > detection_output.txt 2>&1
+          # 关键修复：脚本失败时输出错误日志并回退
+          python "$SCRIPT_PATH" > detection_output.txt 2>&1 || {
+            echo "❌ Detect script failed! Error output:"
+            cat detection_output.txt
+            echo "Falling back to full test suite..."
+            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+            echo "skip_all=false" >> $GITHUB_OUTPUT
+            echo "need_full_test=true" >> $GITHUB_OUTPUT
+            exit 0
+          }
 
           # 处理结果
           if grep -q "selected_paths=" detection_output.txt; then
@@ -281,23 +315,56 @@ jobs:
         id: step_check_skip
         run: echo "skip_all=${{ steps.affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
 
+      # ==================== 核心修复：添加PYTHONPATH解决导入错误 ====================
       - name: Run tests via pytest
         if: steps.step_check_skip.outputs.skip_all != 'true'
         timeout-minutes: 180
         run: |
-          echo "🚀 STARTING PYTEST"
+          echo "🚀 STARTING PYTEST WITH GLOBAL MAPPING-BASED SELECTION"
+          echo "============================================="
+          
           SELECTED_PATHS="${{ steps.affected.outputs.selected_paths }}"
           echo "Selected paths: $SELECTED_PATHS"
-          pytest -vv --cov=deepmd $SELECTED_PATHS --splits 12 --group ${{ matrix.group }} --store-durations --clean-durations --durations-path=.test_durations --splitting-algorithm least_duration --disable-warnings || true
+          echo ""
+          
+          PATH_COUNT=$(echo "$SELECTED_PATHS" | wc -w)
+          echo "Number of test paths: $PATH_COUNT"
+          echo ""
+          
+          if [[ "$SELECTED_PATHS" == "source/tests" ]]; then
+            echo "⚠️ WARNING: Running FULL TEST SUITE"
+            if [[ "${{ steps.affected.outputs.need_full_test }}" == "true" ]]; then
+              echo "Reason: New source file(s) detected without test coverage"
+            fi
+          else
+            echo "✅ Running incremental tests only"
+          fi
+          echo ""
+          
+          # 关键修复：将项目根目录加入Python模块搜索路径
+          export PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH
+          echo "PYTHONPATH configured: $PYTHONPATH"
+          
+          pytest -vv --cov=deepmd $SELECTED_PATHS \
+            --splits 12 --group ${{ matrix.group }} \
+            --store-durations --clean-durations \
+            --durations-path=.test_durations \
+            --splitting-algorithm least_duration \
+            --disable-warnings || true
         env:
           NUM_WORKERS: 0
           DP_CI_IMPORT_PADDLE_BEFORE_TF: 1
           FLAGS_use_stride_compute_kernel: 0
 
+      # ==================== 同步修复TF2测试的导入问题 ====================
       - name: Test TF2 eager mode
         if: matrix.group == 1 && steps.step_check_skip.outputs.skip_all != 'true'
         timeout-minutes: 20
-        run: pytest --cov=deepmd --cov-append source/tests/consistent/io/test_io.py source/jax2tf_tests
+        run: |
+          # 关键修复：添加项目根目录到PYTHONPATH
+          export PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH
+          echo "PYTHONPATH configured: $PYTHONPATH"
+          pytest --cov=deepmd --cov-append source/tests/consistent/io/test_io.py source/jax2tf_tests
         env:
           NUM_WORKERS: 0
           DP_TEST_TF2_ONLY: 1
@@ -347,15 +414,28 @@ jobs:
         with:
           pattern: group-mapping-${{ matrix.python }}-*
           merge-multiple: true
+        continue-on-error: true  # 允许没有group映射的情况
+
       - name: Merge mappings into global mapping
         run: |
           set -x
           GLOBAL_MAPPING=".global_test_mapping_${{ matrix.python }}.json"
           echo "{}" > "$GLOBAL_MAPPING"
+          
+          # 过滤存在的JSON文件，避免通配符匹配失败
           ALL_JSON_FILES=("$GLOBAL_MAPPING" .group_mapping_*.json)
-          if [ ${#ALL_JSON_FILES[@]} -gt 1 ]; then
-            jq -s 'reduce .[] as $item ({}; . * $item | with_entries(.value.dependencies |= (._ // [] | unique | sort) | .value.test_functions |= (._ // [] | unique | sort)))' "${ALL_JSON_FILES[@]}" > "$GLOBAL_MAPPING.tmp" && mv "$GLOBAL_MAPPING.tmp" "$GLOBAL_MAPPING"
+          EXISTING_JSON_FILES=()
+          for f in "${ALL_JSON_FILES[@]}"; do
+            if [ -f "$f" ]; then
+              EXISTING_JSON_FILES+=("$f")
+            fi
+          done
+          
+          if [ ${#EXISTING_JSON_FILES[@]} -gt 1 ]; then
+            jq -s 'reduce .[] as $item ({}; . * $item | with_entries(.value.dependencies |= (._ // [] | unique | sort) | .value.test_functions |= (._ // [] | unique | sort)))' "${EXISTING_JSON_FILES[@]}" > "$GLOBAL_MAPPING.tmp" && mv "$GLOBAL_MAPPING.tmp" "$GLOBAL_MAPPING"
             echo "✅ Merged, total files: $(jq length "$GLOBAL_MAPPING")"
+          else
+            echo "No additional group mapping files to merge."
           fi
       - name: Upload global mapping artifact
         uses: actions/upload-artifact@v7
