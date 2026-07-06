@@ -74,8 +74,12 @@ jobs:
           echo "Base SHA: $BASE_SHA"
           echo "Current SHA: ${{ github.sha }}"
           
-          # 获取变更文件列表（✅ 修复：移除错误的 --diffilter，检测所有变更）
-          CHANGED_FILES=$(git diff --name-only $BASE_SHA ${{ github.sha }})
+          # 获取变更文件列表（✅ 修复：检测所有变更，并捕获错误）
+          CHANGED_FILES=$(git diff --name-only $BASE_SHA ${{ github.sha }}) || {
+            echo "❌ git diff failed! Forcing rebuild."
+            echo "FORCE_REBUILD=true" >> $GITHUB_OUTPUT
+            exit 0
+          }
           
           if [ -n "$CHANGED_FILES" ]; then
             echo "📝 Files changed since base commit:"
@@ -307,8 +311,19 @@ jobs:
             BASE_SHA="HEAD~1"
           fi
 
-          # ✅ 修复：移除错误的 --diffilter，检测所有变更（新增/修改/删除）
-          CHANGED_FILES=$(git diff --name-only $BASE_SHA ${{ github.sha }})
+          # ✅ 关键修复：正确处理 git diff 错误，并在出错时回退到全量测试
+          CHANGED_FILES=$(git diff --name-only $BASE_SHA ${{ github.sha }}) ; DIFF_EXIT_CODE=$?
+          
+          # 如果 git diff 失败，回退到全量测试
+          if [ $DIFF_EXIT_CODE -ne 0 ]; then
+            echo "❌ git diff failed with exit code $DIFF_EXIT_CODE. Falling back to full test."
+            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+            echo "skip_all=false" >> $GITHUB_OUTPUT
+            echo "need_full_test=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # 如果没有变更，跳过测试
           if [ -z "$CHANGED_FILES" ]; then
             echo "❌ NO FILES CHANGED - Skipping tests"
             echo "skip_all=true" >> $GITHUB_OUTPUT
