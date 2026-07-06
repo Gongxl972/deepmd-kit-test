@@ -273,158 +273,321 @@ jobs:
           echo "=========================================="
 
       - name: Detect affected tests using global mapping
-        id: affected
-        run: |
-          set -x
-          echo "=========================================="
-          echo "🔍 STARTING AFFECTED TESTS DETECTION"
-          echo "=========================================="
-          echo "Current directory: $(pwd)"
-          echo "Contents of current directory:"
-          ls -la
-          echo "Looking for .global_test_mapping.json:"
-          ls -la .global_test_mapping.json || echo "File not found!"
-
-          SCRIPT_PATH=$(find .github/scripts -maxdepth 1 -type f -name "*detect*affected*.py" -print -quit)
-          if [ -z "$SCRIPT_PATH" ]; then
-            echo "❌ ERROR: No detect script found, falling back to full test"
-            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
-            echo "skip_all=false" >> $GITHUB_OUTPUT
-            echo "need_full_test=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          echo "✅ Found detect script at: $SCRIPT_PATH"
-          ls -l "$SCRIPT_PATH"
-
-          # 检查映射文件是否存在且有效
-          if [ ! -f ".global_test_mapping.json" ]; then
-            echo "❌ CRITICAL: Global mapping file does not exist!"
-            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
-            echo "skip_all=false" >> $GITHUB_OUTPUT
-            echo "need_full_test=true" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-          
-          if [ ! -s ".global_test_mapping.json" ]; then
-            echo "❌ CRITICAL: Global mapping file is empty!"
-            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
-            echo "skip_all=false" >> $GITHUB_OUTPUT
-            echo "need_full_test=true" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-          
-          # 打印映射文件信息用于调试
-          echo "✅ Global mapping file exists and is not empty."
-          echo "Mapping file size: $(wc -c < .global_test_mapping.json) bytes"
-          echo "Number of entries in mapping: $(jq length .global_test_mapping.json 2>/dev/null || echo 'Invalid JSON')"
-          echo "First few keys in mapping:"
-          jq -r 'keys[:3][]' .global_test_mapping.json 2>/dev/null || echo "Failed to parse JSON"
-
-          # Base SHA 逻辑
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          elif git show-ref --verify --quiet refs/remotes/origin/main; then
-            BASE_SHA=$(git merge-base HEAD origin/main)
-          elif git show-ref --verify --quiet refs/remotes/origin/master; then
-            BASE_SHA=$(git merge-base HEAD origin/master)
-          else
-            BASE_SHA="HEAD~1"
-          fi
-          echo "Base SHA: $BASE_SHA"
-          echo "Current SHA: ${{ github.sha }}"
-
-          # ✅ 关键修复：使用正确的比较方式
-          # 对于 Push 事件，比较当前提交和上一个提交
-          # 对于 PR 事件，比较 PR 的 base 和 head
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            # Push 事件：比较当前提交和父提交
-            COMPARE_SHA="${{ github.sha }}^"
-            echo "Push event: comparing ${{ github.sha }} with parent"
-          else
-            # PR 事件：使用 base.sha
-            COMPARE_SHA=$BASE_SHA
-            echo "Non-push event: comparing with $COMPARE_SHA"
-          fi
-
-          # 获取变更文件列表
-          CHANGED_FILES=$(git diff --name-only $COMPARE_SHA ${{ github.sha }}) ; DIFF_EXIT_CODE=$?
-          echo "Git diff exit code: $DIFF_EXIT_CODE"
-          
-          # 如果 git diff 失败，回退到全量测试
-          if [ $DIFF_EXIT_CODE -ne 0 ]; then
-            echo "❌ git diff failed with exit code $DIFF_EXIT_CODE. Falling back to full test."
-            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
-            echo "skip_all=false" >> $GITHUB_OUTPUT
-            echo "need_full_test=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          # 打印变更文件列表
-          echo "Changed files:"
-          if [ -n "$CHANGED_FILES" ]; then
-            echo "$CHANGED_FILES"
-          else
-            echo "(none)"
-          fi
-          
-          # 如果没有变更，跳过测试
-          if [ -z "$CHANGED_FILES" ]; then
-            echo "❌ NO FILES CHANGED - Skipping tests"
-            echo "skip_all=true" >> $GITHUB_OUTPUT
-            echo "selected_paths=" >> $GITHUB_OUTPUT
-            echo "need_full_test=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # 设置环境变量供脚本使用
-          echo "CHANGED_FILES<<EOF" >> $GITHUB_ENV
-          echo "$CHANGED_FILES" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-          echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
-
-          # 运行检测脚本
-          echo "Running detection script..."
-          python "$SCRIPT_PATH" > detection_output.txt 2>&1
-          SCRIPT_EXIT_CODE=$?
-          
-          echo "Detection script exit code: $SCRIPT_EXIT_CODE"
-          echo "Detection script output:"
-          cat detection_output.txt
-
-          # 检查脚本是否成功
-          if [ $SCRIPT_EXIT_CODE -ne 0 ]; then
-            echo "❌ Detect script failed! Falling back to full test."
-            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
-            echo "skip_all=false" >> $GITHUB_OUTPUT
-            echo "need_full_test=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # 从脚本输出中提取结果
-          if grep -q "selected_paths=" detection_output.txt; then
-            echo "✅ Found selected_paths in script output"
-            grep "selected_paths=" detection_output.txt >> $GITHUB_OUTPUT
-          else
-            echo "⚠️ WARNING: selected_paths not found in script output, falling back to full test."
-            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
-          fi
-
-          if grep -q "skip_all=" detection_output.txt; then
-            grep "skip_all=" detection_output.txt >> $GITHUB_OUTPUT
-          else
-            echo "skip_all=false" >> $GITHUB_OUTPUT
-          fi
-
-          if grep -q "need_full_test=" detection_output.txt; then
-            grep "need_full_test=" detection_output.txt >> $GITHUB_OUTPUT
-          else
-            echo "need_full_test=true" >> $GITHUB_OUTPUT
-          fi
-          
-          echo "=========================================="
-          echo "✅ FINISHED AFFECTED TESTS DETECTION"
-          echo "=========================================="
-
+              id: affected
+              run: |
+                set -x
+                echo "=========================================="
+                echo "🔍 STARTING AFFECTED TESTS DETECTION"
+                echo "=========================================="
+                echo "Current directory: $(pwd)"
+                echo "Contents of current directory:"
+                ls -la
+                echo "Looking for .global_test_mapping.json:"
+                ls -la .global_test_mapping.json || echo "File not found!"
+      
+                SCRIPT_PATH=$(find .github/scripts -maxdepth 1 -type f -name "*detect*affected*.py" -print -quit)
+                if [ -z "$SCRIPT_PATH" ]; then
+                  echo "❌ ERROR: No detect script found, falling back to full test"
+                  echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+                  echo "skip_all=false" >> $GITHUB_OUTPUT
+                  echo "need_full_test=true" >> $GITHUB_OUTPUT
+                  exit 0
+                fi
+                echo "✅ Found detect script at: $SCRIPT_PATH"
+                ls -l "$SCRIPT_PATH"
+      
+                # 检查映射文件是否存在且有效
+                if [ ! -f ".global_test_mapping.json" ]; then
+                  echo "❌ CRITICAL: Global mapping file does not exist!"
+                  echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+                  echo "skip_all=false" >> $GITHUB_OUTPUT
+                  echo "need_full_test=true" >> $GITHUB_OUTPUT
+                  exit 1
+                fi
+                
+                if [ ! -s ".global_test_mapping.json" ]; then
+                  echo "❌ CRITICAL: Global mapping file is empty!"
+                  echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+                  echo "skip_all=false" >> $GITHUB_OUTPUT
+                  echo "need_full_test=true" >> $GITHUB_OUTPUT
+                  exit 1
+                fi
+                
+                # 打印映射文件信息用于调试
+                echo "✅ Global mapping file exists and is not empty."
+                echo "Mapping file size: $(wc -c < .global_test_mapping.json) bytes"
+                echo "Number of entries in mapping: $(jq length .global_test_mapping.json 2>/dev/null || echo 'Invalid JSON')"
+                echo "First few keys in mapping:"
+                jq -r 'keys[:3][]' .global_test_mapping.json 2>/dev/null || echo "Failed to parse JSON"
+      
+                # Base SHA 逻辑
+                if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+                  BASE_SHA="${{ github.event.pull_request.base.sha }}"
+                elif git show-ref --verify --quiet refs/remotes/origin/main; then
+                  BASE_SHA=$(git merge-base HEAD origin/main)
+                elif git show-ref --verify --quiet refs/remotes/origin/master; then
+                  BASE_SHA=$(git merge-base HEAD origin/master)
+                else
+                  BASE_SHA="HEAD~1"
+                fi
+                echo "Base SHA: $BASE_SHA"
+                echo "Current SHA: ${{ github.sha }}"
+      
+                # ✅ 关键修复：使用正确的比较方式
+                # 对于 Push 事件，比较当前提交和上一个提交
+                # 对于 PR 事件，比较 PR 的 base 和 head
+                if [[ "${{ github.event_name }}" == "push" ]]; then
+                  # Push 事件：比较当前提交和父提交
+                  COMPARE_SHA="${{ github.sha }}^"
+                  echo "Push event: comparing ${{ github.sha }} with parent"
+                else
+                  # PR 事件：使用 base.sha
+                  COMPARE_SHA=$BASE_SHA
+                  echo "Non-push event: comparing with $COMPARE_SHA"
+                fi
+      
+                # 获取变更文件列表
+                CHANGED_FILES=$(git diff --name-only $COMPARE_SHA ${{ github.sha }}) ; DIFF_EXIT_CODE=$?
+                echo "Git diff exit code: $DIFF_EXIT_CODE"
+                
+                # 如果 git diff 失败，回退到全量测试
+                if [ $DIFF_EXIT_CODE -ne 0 ]; then
+                  echo "❌ git diff failed with exit code $DIFF_EXIT_CODE. Falling back to full test."
+                  echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+                  echo "skip_all=false" >> $GITHUB_OUTPUT
+                  echo "need_full_test=true" >> $GITHUB_OUTPUT
+                  exit 0
+                fi
+                
+                # 打印变更文件列表
+                echo "Changed files:"
+                if [ -n "$CHANGED_FILES" ]; then
+                  echo "$CHANGED_FILES"
+                else
+                  echo "(none)"
+                fi
+                
+                # 如果没有变更，跳过测试
+                if [ -z "$CHANGED_FILES" ]; then
+                  echo "❌ NO FILES CHANGED - Skipping tests"
+                  echo "skip_all=true" >> $GITHUB_OUTPUT
+                  echo "selected_paths=" >> $GITHUB_OUTPUT
+                  echo "need_full_test=false" >> $GITHUB_OUTPUT
+                  exit 0
+                fi
+      
+                # ✅✅✅ 关键修复：改用文件传递，避免 <<EOF 问题 ✅✅✅
+                # 将变更文件列表写入临时文件
+                echo "$CHANGED_FILES" > /tmp/changed_files.txt
+                echo "CHANGED_FILES_PATH=/tmp/changed_files.txt" >> $GITHUB_ENV
+                
+                # 同时为了兼容，也设置一个单行环境变量（用空格分隔）
+                CHANGED_FILES_SINGLELINE=$(echo "$CHANGED_FILES" | tr '\n' ' ')
+                echo "CHANGED_FILES_SINGLELINE=$CHANGED_FILES_SINGLELINE" >> $GITHUB_ENV
+                
+                # 保留旧的环境变量名称，但使用单行格式（兼容性）
+                echo "CHANGED_FILES=$CHANGED_FILES_SINGLELINE" >> $GITHUB_ENV
+                
+                echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
+                
+                echo "✅ Written changed files to /tmp/changed_files.txt"
+                echo "First few lines of /tmp/changed_files.txt:"
+                head -5 /tmp/changed_files.txt
+      
+                # 运行检测脚本
+                echo "Running detection script..."
+                python "$SCRIPT_PATH" > detection_output.txt 2>&1
+                SCRIPT_EXIT_CODE=$?
+                
+                echo "Detection script exit code: $SCRIPT_EXIT_CODE"
+                echo "Detection script output:"
+                cat detection_output.txt
+      
+                # 检查脚本是否成功
+                if [ $SCRIPT_EXIT_CODE -ne 0 ]; then
+                  echo "❌ Detect script failed! Falling back to full test."
+                  echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+                  echo "skip_all=false" >> $GITHUB_OUTPUT
+                  echo "need_full_test=true" >> $GITHUB_OUTPUT
+                  exit 0
+                fi
+      
+                # 从脚本输出中提取结果
+                if grep -q "selected_paths=" detection_output.txt; then
+                  echo "✅ Found selected_paths in script output"
+                  grep "selected_paths=" detection_output.txt >> $GITHUB_OUTPUT
+                else
+                  echo "⚠️ WARNING: selected_paths not found in script output, falling back to full test."
+                  echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+                fi
+      
+                if grep -q "skip_all=" detection_output.txt; then
+                  grep "skip_all=" detection_output.txt >> $GITHUB_OUTPUT
+                else
+                  echo "skip_all=false" >> $GITHUB_OUTPUT
+                fi
+      
+                if grep -q "need_full_test=" detection_output.txt; then
+                  grep "need_full_test=" detection_output.txt >> $GITHUB_OUTPUT
+                else
+                  echo "need_full_test=true" >> $GITHUB_OUTPUT
+                fi
+                
+                echo "=========================================="
+                echo "✅ FINISHED AFFECTED TESTS DETECTION"
+                echo "=========================================="
+      
+              id: affected
+              run: |
+                set -x
+                echo "=========================================="
+                echo "🔍 STARTING AFFECTED TESTS DETECTION"
+                echo "=========================================="
+                echo "Current directory: $(pwd)"
+                echo "Contents of current directory:"
+                ls -la
+                echo "Looking for .global_test_mapping.json:"
+                ls -la .global_test_mapping.json || echo "File not found!"
+      
+                SCRIPT_PATH=$(find .github/scripts -maxdepth 1 -type f -name "*detect*affected*.py" -print -quit)
+                if [ -z "$SCRIPT_PATH" ]; then
+                  echo "❌ ERROR: No detect script found, falling back to full test"
+                  echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+                  echo "skip_all=false" >> $GITHUB_OUTPUT
+                  echo "need_full_test=true" >> $GITHUB_OUTPUT
+                  exit 0
+                fi
+                echo "✅ Found detect script at: $SCRIPT_PATH"
+                ls -l "$SCRIPT_PATH"
+      
+                # 检查映射文件是否存在且有效
+                if [ ! -f ".global_test_mapping.json" ]; then
+                  echo "❌ CRITICAL: Global mapping file does not exist!"
+                  echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+                  echo "skip_all=false" >> $GITHUB_OUTPUT
+                  echo "need_full_test=true" >> $GITHUB_OUTPUT
+                  exit 1
+                fi
+                
+                if [ ! -s ".global_test_mapping.json" ]; then
+                  echo "❌ CRITICAL: Global mapping file is empty!"
+                  echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+                  echo "skip_all=false" >> $GITHUB_OUTPUT
+                  echo "need_full_test=true" >> $GITHUB_OUTPUT
+                  exit 1
+                fi
+                
+                # 打印映射文件信息用于调试
+                echo "✅ Global mapping file exists and is not empty."
+                echo "Mapping file size: $(wc -c < .global_test_mapping.json) bytes"
+                echo "Number of entries in mapping: $(jq length .global_test_mapping.json 2>/dev/null || echo 'Invalid JSON')"
+                echo "First few keys in mapping:"
+                jq -r 'keys[:3][]' .global_test_mapping.json 2>/dev/null || echo "Failed to parse JSON"
+      
+                # Base SHA 逻辑
+                if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+                  BASE_SHA="${{ github.event.pull_request.base.sha }}"
+                elif git show-ref --verify --quiet refs/remotes/origin/main; then
+                  BASE_SHA=$(git merge-base HEAD origin/main)
+                elif git show-ref --verify --quiet refs/remotes/origin/master; then
+                  BASE_SHA=$(git merge-base HEAD origin/master)
+                else
+                  BASE_SHA="HEAD~1"
+                fi
+                echo "Base SHA: $BASE_SHA"
+                echo "Current SHA: ${{ github.sha }}"
+      
+                # ✅ 关键修复：使用正确的比较方式
+                # 对于 Push 事件，比较当前提交和上一个提交
+                # 对于 PR 事件，比较 PR 的 base 和 head
+                if [[ "${{ github.event_name }}" == "push" ]]; then
+                  # Push 事件：比较当前提交和父提交
+                  COMPARE_SHA="${{ github.sha }}^"
+                  echo "Push event: comparing ${{ github.sha }} with parent"
+                else
+                  # PR 事件：使用 base.sha
+                  COMPARE_SHA=$BASE_SHA
+                  echo "Non-push event: comparing with $COMPARE_SHA"
+                fi
+      
+                # 获取变更文件列表
+                CHANGED_FILES=$(git diff --name-only $COMPARE_SHA ${{ github.sha }}) ; DIFF_EXIT_CODE=$?
+                echo "Git diff exit code: $DIFF_EXIT_CODE"
+                
+                # 如果 git diff 失败，回退到全量测试
+                if [ $DIFF_EXIT_CODE -ne 0 ]; then
+                  echo "❌ git diff failed with exit code $DIFF_EXIT_CODE. Falling back to full test."
+                  echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+                  echo "skip_all=false" >> $GITHUB_OUTPUT
+                  echo "need_full_test=true" >> $GITHUB_OUTPUT
+                  exit 0
+                fi
+                
+                # 打印变更文件列表
+                echo "Changed files:"
+                if [ -n "$CHANGED_FILES" ]; then
+                  echo "$CHANGED_FILES"
+                else
+                  echo "(none)"
+                fi
+                
+                # 如果没有变更，跳过测试
+                if [ -z "$CHANGED_FILES" ]; then
+                  echo "❌ NO FILES CHANGED - Skipping tests"
+                  echo "skip_all=true" >> $GITHUB_OUTPUT
+                  echo "selected_paths=" >> $GITHUB_OUTPUT
+                  echo "need_full_test=false" >> $GITHUB_OUTPUT
+                  exit 0
+                fi
+      
+                # 设置环境变量供脚本使用
+                echo "CHANGED_FILES<<EOF" >> $GITHUB_ENV
+                echo "$CHANGED_FILES" >> $GITHUB_ENV
+                echo "EOF" >> $GITHUB_ENV
+                echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
+      
+                # 运行检测脚本
+                echo "Running detection script..."
+                python "$SCRIPT_PATH" > detection_output.txt 2>&1
+                SCRIPT_EXIT_CODE=$?
+                
+                echo "Detection script exit code: $SCRIPT_EXIT_CODE"
+                echo "Detection script output:"
+                cat detection_output.txt
+      
+                # 检查脚本是否成功
+                if [ $SCRIPT_EXIT_CODE -ne 0 ]; then
+                  echo "❌ Detect script failed! Falling back to full test."
+                  echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+                  echo "skip_all=false" >> $GITHUB_OUTPUT
+                  echo "need_full_test=true" >> $GITHUB_OUTPUT
+                  exit 0
+                fi
+      
+                # 从脚本输出中提取结果
+                if grep -q "selected_paths=" detection_output.txt; then
+                  echo "✅ Found selected_paths in script output"
+                  grep "selected_paths=" detection_output.txt >> $GITHUB_OUTPUT
+                else
+                  echo "⚠️ WARNING: selected_paths not found in script output, falling back to full test."
+                  echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+                fi
+      
+                if grep -q "skip_all=" detection_output.txt; then
+                  grep "skip_all=" detection_output.txt >> $GITHUB_OUTPUT
+                else
+                  echo "skip_all=false" >> $GITHUB_OUTPUT
+                fi
+      
+                if grep -q "need_full_test=" detection_output.txt; then
+                  grep "need_full_test=" detection_output.txt >> $GITHUB_OUTPUT
+                else
+                  echo "need_full_test=true" >> $GITHUB_OUTPUT
+                fi
+                
+                echo "=========================================="
+                echo "✅ FINISHED AFFECTED TESTS DETECTION"
+                echo "=========================================="
       - name: Debug affected outputs
         run: |
           echo "skip_all: ${{ steps.affected.outputs.skip_all }}"
