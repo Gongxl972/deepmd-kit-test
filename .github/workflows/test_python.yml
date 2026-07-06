@@ -74,8 +74,8 @@ jobs:
           echo "Base SHA: $BASE_SHA"
           echo "Current SHA: ${{ github.sha }}"
           
-          # 获取变更文件列表
-          CHANGED_FILES=$(git diff --name-only --diff-filter=d $BASE_SHA ${{ github.sha }})
+          # 获取变更文件列表（✅ 修复：移除错误的 --diffilter，检测所有变更）
+          CHANGED_FILES=$(git diff --name-only $BASE_SHA ${{ github.sha }})
           
           if [ -n "$CHANGED_FILES" ]; then
             echo "📝 Files changed since base commit:"
@@ -307,7 +307,8 @@ jobs:
             BASE_SHA="HEAD~1"
           fi
 
-          CHANGED_FILES=$(git diff --name-only --diffilter=d $BASE_SHA ${{ github.sha }})
+          # ✅ 修复：移除错误的 --diffilter，检测所有变更（新增/修改/删除）
+          CHANGED_FILES=$(git diff --name-only $BASE_SHA ${{ github.sha }})
           if [ -z "$CHANGED_FILES" ]; then
             echo "❌ NO FILES CHANGED - Skipping tests"
             echo "skip_all=true" >> $GITHUB_OUTPUT
