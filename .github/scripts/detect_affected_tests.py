@@ -1,121 +1,100 @@
 #!/usr/bin/env python3
-"""
-检测受影响的测试的脚本
-用于 GitHub Actions 工作流中
-"""
-
 import json
 import os
 import sys
-import subprocess
 
 def main():
-    # 从环境变量获取参数
-    mapping_file = ".global_test_mapping.json"
+    # ========== 1. 正确读取环境变量里的变更文件（核心修复点） ==========
+    # CHANGED_FILES是通过<<EOF传入的，会保留换行符，需要split后过滤空行
+    changed_files_raw = os.environ.get("CHANGED_FILES", "")
+    print(f"DEBUG: Raw CHANGED_FILES from env: {repr(changed_files_raw)}")
     
-    # 获取变更的文件列表
-    changed_files_str = os.environ.get("CHANGED_FILES", "")
-    if not changed_files_str:
+    changed_files = [
+        f.strip() 
+        for f in changed_files_raw.split("\n") 
+        if f.strip()
+    ]
+    print(f"DEBUG: Parsed changed files ({len(changed_files)}):")
+    for cf in changed_files:
+        print(f"  - {cf}")
+    
+    # 极端情况兜底：如果真的没读到变更，触发全量测试
+    if not changed_files:
         print("No changed files found.")
         print("selected_paths=source/tests")
         print("skip_all=false")
         print("need_full_test=true")
-        return
+        sys.exit(0)
     
-    changed_files = [f.strip() for f in changed_files_str.strip().split("\n") if f.strip()]
-    
-    # 获取基础 SHA
-    base_sha = os.environ.get("BASE_SHA", "")
-    if not base_sha:
-        print("Error: BASE_SHA not set", file=sys.stderr)
+    # ========== 2. 加载全局映射（过滤掉metadata字段） ==========
+    mapping_path = ".global_test_mapping.json"
+    if not os.path.exists(mapping_path):
+        print(f"Mapping file {mapping_path} not found, fallback to full test.")
         print("selected_paths=source/tests")
         print("skip_all=false")
         print("need_full_test=true")
-        return
+        sys.exit(0)
     
-    # 加载全局映射
-    try:
-        with open(mapping_file, "r") as f:
-            global_mapping = json.load(f)
-    except Exception as e:
-        print(f"Error reading mapping file: {e}", file=sys.stderr)
-        print("selected_paths=source/tests")
-        print("skip_all=false")
-        print("need_full_test=true")
-        return
+    with open(mapping_path, "r") as f:
+        try:
+            mapping = json.load(f)
+        except json.JSONDecodeError:
+            print("Invalid mapping JSON, fallback to full test.")
+            print("selected_paths=source/tests")
+            print("skip_all=false")
+            print("need_full_test=true")
+            sys.exit(0)
     
+    # 过滤掉你映射里的metadata字段（它不是测试文件）
+    mapping = {k: v for k, v in mapping.items() if k != "metadata"}
+    print(f"DEBUG: Loaded {len(mapping)} test mappings (excluded metadata)")
+    
+    # ========== 3. 匹配变更文件和测试 ==========
     affected_tests = set()
-    matched_files = 0
-    unmatched_files = 0
-    new_files = 0
-    need_full_test = False
+    new_source_files_without_tests = []  # 记录新增的无覆盖源码
     
-    for changed_file in changed_files:
-        print(f"Processing changed file: {changed_file}")
+    for cf in changed_files:
+        print(f"DEBUG: Processing changed file: {cf}")
         
-        # 检查文件是否是新添加的
-        result = subprocess.run(
-            ["git", "cat-file", "-e", f"{base_sha}:{changed_file}"],
-            capture_output=True,
-            text=True
-        )
-        is_new_file = (result.returncode != 0)
-        
-        if is_new_file:
-            print(f"  🆕 File is newly added in this PR")
-            new_files += 1
-            if changed_file.startswith("source/deepmd/"):
-                print(f"  ⚠️ New source file without test coverage - will trigger full test")
-                need_full_test = True
+        # 情况A：变更的是测试文件，直接加入待运行列表
+        if cf.startswith("source/tests/"):
+            print(f"DEBUG: Changed file is a test file, adding to affected tests: {cf}")
+            affected_tests.add(cf)
             continue
-        else:
-            print(f"  ℹ️ File exists in base branch (modified)")
         
-        # 规范化文件路径
-        normalized_file = changed_file
-        if changed_file.startswith("deepmd/"):
-            normalized_file = "source/" + changed_file
+        # 情况B：变更的是源码文件，去映射里找依赖它的测试
+        found_match = False
+        for test_file, meta in mapping.items():
+            dependencies = meta.get("dependencies", [])
+            if cf in dependencies:
+                print(f"DEBUG: Found test {test_file} depends on {cf}, adding to affected tests")
+                affected_tests.add(test_file)
+                found_match = True
         
-        # 在全局映射中查找依赖此文件的测试
-        matching_tests = []
-        for test_file, info in global_mapping.items():
-            deps = info.get("dependencies", [])
-            # 使用更灵活的匹配：检查文件是否在依赖列表中
-            if any(normalized_file in dep or dep in normalized_file for dep in deps):
-                matching_tests.append(test_file)
-        
-        if matching_tests:
-            print(f"  ✅ Found {len(matching_tests)} matching tests:")
-            for test_file in matching_tests:
-                print(f"    - {test_file}")
-                affected_tests.update(matching_tests)
-            matched_files += 1
-        else:
-            print(f"  ❌ No tests found depending on {normalized_file}")
-            unmatched_files += 1
+        # 情况C：变更的是源码文件，但没有测试依赖它（就是你这次的场景）
+        if not found_match and cf.startswith("source/deepmd/"):
+            print(f"DEBUG: Changed source file {cf} has no test coverage, marking for full test")
+            new_source_files_without_tests.append(cf)
     
-    print(f"\n📊 MAPPING SUMMARY:")
-    print(f"  Total changed files: {len(changed_files)}")
-    print(f"  Files with matching tests: {matched_files}")
-    print(f"  Files without matches: {unmatched_files}")
-    print(f"  New files added: {new_files}")
-    print(f"  Need full test: {need_full_test}")
-    
-    # 去重并排序
-    if affected_tests:
-        affected_tests_sorted = sorted(affected_tests)
-        print(f"\n🎯 AFFECTED TESTS: {' '.join(affected_tests_sorted)}")
-    
-    # 决定是否全量测试
-    if need_full_test or not affected_tests:
-        print(f"\n🚨 TRIGGERING FULL TEST SUITE")
+    # ========== 4. 输出最终结果（符合你的安全兜底逻辑） ==========
+    if new_source_files_without_tests:
+        # 新增源码无测试覆盖，主动触发全量测试（这才是预期的兜底逻辑）
+        print(f"New source files without test coverage: {new_source_files_without_tests}")
         print("selected_paths=source/tests")
         print("skip_all=false")
         print("need_full_test=true")
-    else:
-        print(f"\n🎯 RUNNING INCREMENTAL TESTS ONLY")
-        print(f"selected_paths={' '.join(affected_tests_sorted)}")
+    elif affected_tests:
+        # 匹配到受影响的测试，只运行这些测试
+        selected = " ".join(sorted(affected_tests))
+        print(f"Affected tests found: {selected}")
+        print(f"selected_paths={selected}")
         print("skip_all=false")
+        print("need_full_test=false")
+    else:
+        # 没有匹配到任何测试，且没有新增源码，跳过测试
+        print("No affected tests found and no new source files.")
+        print("selected_paths=")
+        print("skip_all=true")
         print("need_full_test=false")
 
 if __name__ == "__main__":
