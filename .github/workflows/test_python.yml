@@ -187,7 +187,6 @@ jobs:
         with:
           name: global-test-mapping
           path: .
-        # 校验下载结果
         continue-on-error: false
 
       - name: Restore failed tests cache
@@ -207,6 +206,7 @@ jobs:
           echo "=========================================="
           timeout 300 pytest --collect-only -q --splits 12 --group ${{ matrix.group }} source/tests/ --disable-warnings > collected_modules.txt || true
           grep -oP '(?<=<Module ).*?(?=>)' collected_modules.txt | sort -u > test_files.txt || true
+          
           if [ ! -s "test_files.txt" ]; then
             echo "⚠️ No test files collected for group ${{ matrix.group }}"
             echo "group_test_files=" >> $GITHUB_OUTPUT
@@ -228,7 +228,6 @@ jobs:
           echo "=========================================="
           echo "Current directory: $(pwd)"
 
-          # 自动查找检测脚本
           SCRIPT_PATH=$(find .github/scripts -maxdepth 1 -type f -name "*detect*affected*.py" -print -quit)
           if [ -z "$SCRIPT_PATH" ]; then
             echo "❌ ERROR: No detect script found, falling back to full test"
@@ -259,7 +258,7 @@ jobs:
             BASE_SHA="HEAD~1"
           fi
 
-          CHANGED_FILES=$(git diff --name-only --diff-filter=d $BASE_SHA ${{ github.sha }})
+          CHANGED_FILES=$(git diff --name-only --diffilter=d $BASE_SHA ${{ github.sha }})
           if [ -z "$CHANGED_FILES" ]; then
             echo "❌ NO FILES CHANGED - Skipping tests"
             echo "skip_all=true" >> $GITHUB_OUTPUT
@@ -268,39 +267,23 @@ jobs:
             exit 0
           fi
 
-          # 设置环境变量
           echo "CHANGED_FILES<<EOF" >> $GITHUB_ENV
           echo "$CHANGED_FILES" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
 
-          # 关键修复：脚本失败时输出错误日志并回退
           python "$SCRIPT_PATH" > detection_output.txt 2>&1 || {
-            echo "❌ Detect script failed! Error output:"
+            echo "❌ Detect script failed! Falling back to full test."
             cat detection_output.txt
-            echo "Falling back to full test suite..."
             echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
             echo "skip_all=false" >> $GITHUB_OUTPUT
             echo "need_full_test=true" >> $GITHUB_OUTPUT
             exit 0
           }
 
-          # 处理结果
-          if grep -q "selected_paths=" detection_output.txt; then
-            grep "selected_paths=" detection_output.txt >> $GITHUB_OUTPUT
-          else
-            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
-          fi
-          if grep -q "skip_all=" detection_output.txt; then
-            grep "skip_all=" detection_output.txt >> $GITHUB_OUTPUT
-          else
-            echo "skip_all=false" >> $GITHUB_OUTPUT
-          fi
-          if grep -q "need_full_test=" detection_output.txt; then
-            grep "need_full_test=" detection_output.txt >> $GITHUB_OUTPUT
-          else
-            echo "need_full_test=true" >> $GITHUB_OUTPUT
-          fi
+          grep "selected_paths=" detection_output.txt >> $GITHUB_OUTPUT || echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+          grep "skip_all=" detection_output.txt >> $GITHUB_OUTPUT || echo "skip_all=false" >> $GITHUB_OUTPUT
+          grep "need_full_test=" detection_output.txt >> $GITHUB_OUTPUT || echo "need_full_test=true" >> $GITHUB_OUTPUT
           echo "=========================================="
           echo "✅ FINISHED AFFECTED TESTS DETECTION"
           echo "=========================================="
@@ -322,26 +305,9 @@ jobs:
         run: |
           echo "🚀 STARTING PYTEST WITH GLOBAL MAPPING-BASED SELECTION"
           echo "============================================="
-          
           SELECTED_PATHS="${{ steps.affected.outputs.selected_paths }}"
           echo "Selected paths: $SELECTED_PATHS"
-          echo ""
           
-          PATH_COUNT=$(echo "$SELECTED_PATHS" | wc -w)
-          echo "Number of test paths: $PATH_COUNT"
-          echo ""
-          
-          if [[ "$SELECTED_PATHS" == "source/tests" ]]; then
-            echo "⚠️ WARNING: Running FULL TEST SUITE"
-            if [[ "${{ steps.affected.outputs.need_full_test }}" == "true" ]]; then
-              echo "Reason: New source file(s) detected without test coverage"
-            fi
-          else
-            echo "✅ Running incremental tests only"
-          fi
-          echo ""
-          
-          # 关键修复：将项目根目录加入Python模块搜索路径
           export PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH
           echo "PYTHONPATH configured: $PYTHONPATH"
           
@@ -356,12 +322,10 @@ jobs:
           DP_CI_IMPORT_PADDLE_BEFORE_TF: 1
           FLAGS_use_stride_compute_kernel: 0
 
-      # ==================== 同步修复TF2测试的导入问题 ====================
       - name: Test TF2 eager mode
         if: matrix.group == 1 && steps.step_check_skip.outputs.skip_all != 'true'
         timeout-minutes: 20
         run: |
-          # 关键修复：添加项目根目录到PYTHONPATH
           export PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH
           echo "PYTHONPATH configured: $PYTHONPATH"
           pytest --cov=deepmd --cov-append source/tests/consistent/io/test_io.py source/jax2tf_tests
@@ -369,6 +333,15 @@ jobs:
           NUM_WORKERS: 0
           DP_TEST_TF2_ONLY: 1
           DP_DTYPE_PROMOTION_STRICT: 1
+
+      # ==================== 关键修复：确保测试时长文件始终存在 ====================
+      - name: Ensure test durations file exists
+        if: always()
+        run: |
+          if [ ! -f .test_durations ]; then
+            echo "⚠️ No test durations generated (tests skipped/no tests run), creating empty file."
+            echo "{}" > .test_durations
+          fi
 
       - name: Save failed tests cache
         if: always()
@@ -381,13 +354,13 @@ jobs:
             rm -f "$FAILED_TESTS_FILE"
           fi
 
-      - run: mv .test_durations .test_durations_${{ matrix.group }}
+      - run: mv .test_durations .test_durations_${{ matrix.python }}_${{ matrix.group }}.json
 
       - name: Upload partial durations
         uses: actions/upload-artifact@v7
         with:
           name: split-${{ matrix.python }}-${{ matrix.group }}
-          path: .test_durations_${{ matrix.python }}.json
+          path: .test_durations_${{ matrix.python }}_${{ matrix.group }}.json
           include-hidden-files: true
 
       - name: Upload coverage to Codecov
@@ -396,61 +369,14 @@ jobs:
         with:
           use_oidc: true
 
-  # ==================== 合并所有group的映射文件 ====================
-  merge_mappings:
-    name: Merge all group mappings
-    runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        python: ["3.10", "3.13"]
-    needs: testpython
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ matrix.python }}
-      - name: Download all group mappings
-        uses: actions/download-artifact@v8
-        with:
-          pattern: group-mapping-${{ matrix.python }}-*
-          merge-multiple: true
-        continue-on-error: true  # 允许没有group映射的情况
-
-      - name: Merge mappings into global mapping
-        run: |
-          set -x
-          GLOBAL_MAPPING=".global_test_mapping_${{ matrix.python }}.json"
-          echo "{}" > "$GLOBAL_MAPPING"
-          
-          # 过滤存在的JSON文件，避免通配符匹配失败
-          ALL_JSON_FILES=("$GLOBAL_MAPPING" .group_mapping_*.json)
-          EXISTING_JSON_FILES=()
-          for f in "${ALL_JSON_FILES[@]}"; do
-            if [ -f "$f" ]; then
-              EXISTING_JSON_FILES+=("$f")
-            fi
-          done
-          
-          if [ ${#EXISTING_JSON_FILES[@]} -gt 1 ]; then
-            jq -s 'reduce .[] as $item ({}; . * $item | with_entries(.value.dependencies |= (._ // [] | unique | sort) | .value.test_functions |= (._ // [] | unique | sort)))' "${EXISTING_JSON_FILES[@]}" > "$GLOBAL_MAPPING.tmp" && mv "$GLOBAL_MAPPING.tmp" "$GLOBAL_MAPPING"
-            echo "✅ Merged, total files: $(jq length "$GLOBAL_MAPPING")"
-          else
-            echo "No additional group mapping files to merge."
-          fi
-      - name: Upload global mapping artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: global-test-mapping-${{ matrix.python }}
-          path: .global_test_mapping_${{ matrix.python }}.json
-          include-hidden-files: true
-
+  # ==================== 合并测试时长数据（修复jq报错）====================
   update_durations:
     name: Combine and update integration test durations
     runs-on: ubuntu-22.04
     strategy:
       matrix:
         python: ["3.10", "3.13"]
-    needs: [testpython, merge_mappings]
+    needs: [testpython]
     steps:
       - name: Get durations from cache
         uses: actions/cache@v5
@@ -458,16 +384,29 @@ jobs:
           path: .test_durations
           key: test2-durations-combined-${{ matrix.python }}-${{ github.sha }}
           restore-keys: test2-durations-combined-${{ matrix.python }}
+
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
           pattern: split-${{ matrix.python }}-*
           merge-multiple: true
-      - run: jq -s add .test_durations_* > .test_durations
 
+      - name: Combine test durations
+        run: |
+          set -x
+          # 关键修复：处理无duration文件的情况
+          if ls .test_durations_*.json 1> /dev/null 2>&1; then
+            echo "✅ Found duration files for Python ${{ matrix.python }}, merging..."
+            jq -s add .test_durations_*.json > .test_durations
+          else
+            echo "⚠️ No duration files found for Python ${{ matrix.python }}, creating empty file."
+            echo "{}" > .test_durations
+          fi
+
+  # ==================== 最终校验 ====================
   pass:
     name: Pass testing Python
-    needs: [testpython, merge_mappings, update_durations]
+    needs: [testpython, update_durations]
     runs-on: ubuntu-latest
     if: always()
     steps:
