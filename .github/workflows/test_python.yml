@@ -53,6 +53,46 @@ jobs:
           restore-keys: |
             global-test-mapping-
 
+      # ==================== 新增：检测文件变更以决定是否重建映射 ====================
+      - name: Check for file changes since last mapping build
+        id: check_changes
+        run: |
+          set -x
+          echo "Checking for file changes since last mapping build..."
+          
+          # 获取上次构建映射时的commit SHA（从缓存的映射文件中读取元数据）
+          LAST_MAPPING_SHA=""
+          if [ -f ".global_test_mapping.json" ] && [ -s ".global_test_mapping.json" ]; then
+            # 尝试从映射文件中读取构建时的SHA（如果之前保存了的话）
+            LAST_MAPPING_SHA=$(jq -r '.metadata.last_built_sha // empty' .global_test_mapping.json 2>/dev/null || echo "")
+          fi
+          
+          # 如果无法从映射文件获取，则使用缓存key中的SHA（通过restore-keys匹配的最近缓存）
+          if [ -z "$LAST_MAPPING_SHA" ]; then
+            # 回退到使用git log查找最近的相关提交
+            LAST_MAPPING_SHA=$(git log --all --format="%H" -- .global_test_mapping.json | head -1 || echo "")
+          fi
+          
+          echo "Last mapping built at SHA: $LAST_MAPPING_SHA"
+          echo "Current SHA: ${{ github.sha }}"
+          
+          # 比较是否有文件变更
+          if [ -n "$LAST_MAPPING_SHA" ] && [ "$LAST_MAPPING_SHA" != "${{ github.sha }}" ]; then
+            CHANGED_FILES=$(git diff --name-only --diff-filter=d $LAST_MAPPING_SHA ${{ github.sha }})
+            if [ -n "$CHANGED_FILES" ]; then
+              echo "📝 Files changed since last mapping build:"
+              echo "$CHANGED_FILES"
+              echo "FORCE_REBUILD=true" >> $GITHUB_OUTPUT
+            else
+              echo "✅ No files changed since last mapping build"
+              echo "FORCE_REBUILD=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            # 如果没有上次构建记录，或者SHA相同，则强制重建
+            echo "🆕 No previous mapping build record found or same SHA, forcing rebuild"
+            echo "FORCE_REBUILD=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build global test mapping (Safe Mode)
         run: |
           set -x
@@ -61,6 +101,7 @@ jobs:
           echo "=========================================="
           echo "Current directory: $(pwd)"
           echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
+          echo "Force rebuild flag: ${{ steps.check_changes.outputs.FORCE_REBUILD }}"
 
           # 自动查找映射构建脚本
           SCRIPT_PATH=$(find .github/scripts -maxdepth 1 -type f -name "*global*mapping*.py" -print -quit)
@@ -76,9 +117,9 @@ jobs:
           echo "✅ Found script at: $SCRIPT_PATH"
           ls -l "$SCRIPT_PATH" || { echo "❌ Script path invalid!"; exit 1; }
 
-          # 缓存命中逻辑
-          if [ -f ".global_test_mapping.json" ] && [ -s ".global_test_mapping.json" ]; then
-            echo "✅ Using cached global mapping"
+          # 缓存命中逻辑：只有当不需要强制重建时才使用缓存
+          if [ "${{ steps.check_changes.outputs.FORCE_REBUILD }}" != "true" ] && [ -f ".global_test_mapping.json" ] && [ -s ".global_test_mapping.json" ]; then
+            echo "✅ Using cached global mapping (no file changes detected)"
             echo "Cached mapping contains $(jq length .global_test_mapping.json) test files"
             echo "=========================================="
             echo "✅ GLOBAL MAPPING READY"
@@ -86,7 +127,12 @@ jobs:
             exit 0
           fi
           
-          echo "🆕 Building fresh global mapping..."
+          if [ "${{ steps.check_changes.outputs.FORCE_REBUILD }}" == "true" ]; then
+            echo "🆕 File changes detected, forcing fresh global mapping build..."
+          else
+            echo "🆕 No valid cached mapping found, building fresh global mapping..."
+          fi
+          
           find source/tests -name "test_*.py" -type f > test_files.txt || true
           
           if [ ! -s "test_files.txt" ]; then
@@ -107,6 +153,16 @@ jobs:
 
           # 清理临时文件
           rm -f test_files.txt
+
+          # 添加元数据到映射文件（记录构建时的SHA）
+          if [ -s ".global_test_mapping.json" ]; then
+            # 使用jq添加元数据
+            jq --arg sha "${{ github.sha }}" \
+               --arg date "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+               '. + {metadata: {last_built_sha: $sha, last_built_date: $date}}' \
+               .global_test_mapping.json > .global_test_mapping.json.tmp && \
+               mv .global_test_mapping.json.tmp .global_test_mapping.json
+          fi
 
           # 验证结果
           if [ -s ".global_test_mapping.json" ]; then
