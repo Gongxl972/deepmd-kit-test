@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ==================== 第一阶段：早期变更检测（最高优先级）====================
+  # ==================== 第一阶段：早期变更检测（最高优先级，新增强制全量逻辑）====================
   early-detection:
     name: Early Change Detection
     runs-on: ubuntu-22.04
@@ -23,7 +23,7 @@ jobs:
       has_changes: ${{ steps.detect.outputs.has_changes }}
       has_test_changes: ${{ steps.detect.outputs.has_test_changes }}
       new_source_files: ${{ steps.detect.outputs.new_source_files }}
-      missing_tests: ${{ steps.validate.outputs.missing_tests }}
+      force_full_test: ${{ steps.validate.outputs.force_full_test }}
       compare_sha: ${{ steps.setup.outputs.compare_sha }}
     steps:
       - uses: actions/checkout@v6
@@ -62,7 +62,6 @@ jobs:
           echo "Changed files:"
           echo "$CHANGED_FILES"
           
-          # 检查是否有任何变更
           if [ -n "$CHANGED_FILES" ]; then
             echo "has_changes=true" >> $GITHUB_OUTPUT
           else
@@ -72,16 +71,15 @@ jobs:
           # 检查是否有测试文件变更
           HAS_TEST_CHANGES=$(echo "$CHANGED_FILES" | grep -c '^source/tests/' || true)
           echo "has_test_changes=$HAS_TEST_CHANGES" >> $GITHUB_OUTPUT
-          echo "Test file changes detected: $HAS_TEST_CHANGES"
           
-          # 收集新增的源码文件
+          # 收集新增的源码文件（关键：只关心新增的，不关心修改的）
           NEW_SOURCE_FILES=$(git diff --name-status $COMPARE_SHA ${{ github.sha }} | grep '^A' | cut -f2- | grep '^source/deepmd/.*\.py$' || true)
           echo "new_source_files<<EOF" >> $GITHUB_OUTPUT
           echo "$NEW_SOURCE_FILES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
           
           if [ -n "$NEW_SOURCE_FILES" ]; then
-            echo "New source files detected:"
+            echo "🆕 New source files detected:"
             echo "$NEW_SOURCE_FILES"
           else
             echo "No new source files detected"
@@ -89,51 +87,26 @@ jobs:
           
           echo "=========================================="
 
-      - name: Validate new source files have tests
+      - name: Validate and decide test strategy
         id: validate
         run: |
           set -x
           echo "=========================================="
-          echo "🛡️ VALIDATING NEW SOURCE FILES"
+          echo "🛡️ DECIDING TEST STRATEGY"
           echo "=========================================="
           
           NEW_SOURCE_FILES="${{ steps.detect.outputs.new_source_files }}"
-          MISSING_TESTS=false
+          FORCE_FULL_TEST="false"
           
           if [ -n "$NEW_SOURCE_FILES" ]; then
-            echo "Checking test coverage for new source files..."
-            
-            # 获取本次提交中所有新增的文件（包括测试文件）
-            COMPARE_SHA="${{ steps.setup.outputs.compare_sha }}"
-            ALL_NEW_FILES=$(git diff --name-status $COMPARE_SHA ${{ github.sha }} | grep '^A' | cut -f2-)
-            echo "All new files in this commit:"
-            echo "$ALL_NEW_FILES"
-            
-            # 检查每个新源码文件是否有对应的测试文件
-            echo "$NEW_SOURCE_FILES" | while read -r src; do
-              if [ -n "$src" ]; then
-                SRC_NAME=$(basename "$src" .py)
-                EXPECTED_TEST="source/tests/test_${SRC_NAME}.py"
-                
-                # 检查测试文件是否也在本次提交的新文件中
-                if echo "$ALL_NEW_FILES" | grep -q "^$EXPECTED_TEST$"; then
-                  echo "✅ Found matching test for $src: $EXPECTED_TEST"
-                elif [ -f "$EXPECTED_TEST" ]; then
-                  echo "✅ Found existing test for $src: $EXPECTED_TEST"
-                else
-                  echo "⚠️ Missing test for $src"
-                  echo "   Expected: $EXPECTED_TEST"
-                  echo "   Will run full test suite to ensure coverage."
-                  MISSING_TESTS=true
-                fi
-              fi
-            done
+            echo "⚠️ New source files found. Regardless of mapping, full test suite is required."
+            echo "Reason: New files might not be imported by existing tests and cannot be verified by incremental testing."
+            FORCE_FULL_TEST="true"
           else
-            echo "No new source files to validate"
+            echo "✅ No new source files. Incremental testing is possible."
           fi
           
-          echo "missing_tests=$MISSING_TESTS" >> $GITHUB_OUTPUT
-          echo "✅ Validation complete"
+          echo "force_full_test=$FORCE_FULL_TEST" >> $GITHUB_OUTPUT
           echo "=========================================="
 
   # ==================== 第二阶段：条件构建全局映射 ====================
@@ -141,7 +114,6 @@ jobs:
     name: Build Global Test Mapping
     runs-on: ubuntu-22.04
     needs: early-detection
-    # 只要有变更就重建映射，特别是有新源码文件时
     if: needs.early-detection.outputs.has_changes == 'true'
     strategy:
       matrix:
@@ -168,14 +140,55 @@ jobs:
         env:
           CMAKE_POLICY_VERSION_MINIMUM: 3.5
 
-      - name: Build global test mapping
+      - name: Restore global mapping cache
+        uses: actions/cache@v5
+        with:
+          path: .global_test_mapping.json
+          key: global-test-mapping-${{ github.sha }}
+          restore-keys: |
+            global-test-mapping-
+
+      - name: Check for file changes
+        id: check_changes
+        run: |
+          set -x
+          echo "Checking for file changes..."
+          
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          elif git show-ref --verify --quiet refs/remotes/origin/main; then
+            BASE_SHA=$(git merge-base HEAD origin/main)
+          elif git show-ref --verify --quiet refs/remotes/origin/master; then
+            BASE_SHA=$(git merge-base HEAD origin/master)
+          else
+            BASE_SHA="HEAD~1"
+          fi
+          
+          echo "Base SHA: $BASE_SHA"
+          echo "Current SHA: ${{ github.sha }}"
+          
+          CHANGED_FILES=$(git diff --name-only $BASE_SHA ${{ github.sha }}) || {
+            echo "❌ git diff failed! Forcing rebuild."
+            echo "FORCE_REBUILD=true" >> $GITHUB_OUTPUT
+            exit 0
+          }
+          
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "📝 Files changed since base commit:"
+            echo "$CHANGED_FILES"
+            echo "FORCE_REBUILD=true" >> $GITHUB_OUTPUT
+          else
+            echo "✅ No files changed since base commit"
+            echo "FORCE_REBUILD=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build global test mapping (Safe Mode)
         run: |
           set -x
           echo "=========================================="
-          echo "🔨 BUILDING GLOBAL TEST MAPPING"
+          echo "🔨 BUILDING GLOBAL TEST MAPPING (SAFE MODE)"
           echo "=========================================="
           
-          # 自动查找映射构建脚本
           SCRIPT_PATH=$(find .github/scripts -maxdepth 1 -type f -name "*global*mapping*.py" -print -quit)
           
           if [ -z "$SCRIPT_PATH" ]; then
@@ -186,7 +199,11 @@ jobs:
           
           echo "✅ Found script at: $SCRIPT_PATH"
           
-          # 收集测试文件
+          if [ "${{ steps.check_changes.outputs.FORCE_REBUILD }}" != "true" ] && [ -f ".global_test_mapping.json" ] && [ -s ".global_test_mapping.json" ]; then
+            echo "✅ Using cached global mapping"
+            exit 0
+          fi
+          
           find source/tests -name "test_*.py" -type f > test_files.txt || true
           
           if [ ! -s "test_files.txt" ]; then
@@ -198,7 +215,6 @@ jobs:
           TOTAL_FILES=$(wc -l < test_files.txt)
           echo "Found $TOTAL_FILES test files"
           
-          # 构建映射
           timeout 600 python "$SCRIPT_PATH" || {
             echo "❌ Mapping script failed!"
             echo "{}" > .global_test_mapping.json
@@ -207,7 +223,6 @@ jobs:
           
           rm -f test_files.txt
           
-          # 添加元数据
           if [ -s ".global_test_mapping.json" ]; then
             jq --arg sha "${{ github.sha }}" \
                --arg date "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
@@ -231,7 +246,6 @@ jobs:
     name: Test Python
     runs-on: ubuntu-22.04
     needs: [early-detection, build-global-mapping]
-    # 如果没有变更，跳过整个测试作业
     if: needs.early-detection.outputs.has_changes == 'true'
     strategy:
       fail-fast: false
@@ -277,7 +291,7 @@ jobs:
           HOROVOD_WITH_MPI: 1
           CMAKE_POLICY_VERSION_MINIMUM: 3.5
 
-      # ==================== 防线1：语法预检（使用早期检测的SHA）====================
+      # ==================== 防线1：语法预检 ====================
       - name: Syntax check changed source files
         run: |
           set -x
@@ -307,7 +321,6 @@ jobs:
           echo "✅ All changed source files passed syntax check"
           echo "=========================================="
 
-      # ==================== 下载映射文件（如果存在）====================
       - name: Download global mapping
         uses: actions/download-artifact@v8
         with:
@@ -323,44 +336,40 @@ jobs:
           restore-keys: |
             failed-tests-${{ matrix.python }}-${{ matrix.group }}-
 
-      # ==================== 准备变更文件数据 ====================
-      - name: Prepare changed files for detection
-        id: prepare_changed
+      # ==================== 关键修改：根据早期检测结果决定测试范围 ====================
+      - name: Determine test scope
+        id: determine_scope
         run: |
           set -x
           echo "=========================================="
-          echo "📝 PREPARING CHANGED FILES FOR DETECTION"
+          echo "🎯 DETERMINING TEST SCOPE"
           echo "=========================================="
           
-          COMPARE_SHA="${{ needs.early-detection.outputs.compare_sha }}"
-          CHANGED_FILES=$(git diff --name-only $COMPARE_SHA ${{ github.sha }})
+          FORCE_FULL_TEST="${{ needs.early-detection.outputs.force_full_test }}"
           
-          echo "Changed files:"
-          echo "$CHANGED_FILES"
-          
-          echo "$CHANGED_FILES" > /tmp/changed_files.txt
-          echo "CHANGED_FILES_PATH=/tmp/changed_files.txt" >> $GITHUB_ENV
-          echo "BASE_SHA=$COMPARE_SHA" >> $GITHUB_ENV
+          if [ "$FORCE_FULL_TEST" == "true" ]; then
+            echo "🆕 New source files detected in early detection."
+            echo "Forcing FULL test suite to ensure coverage."
+            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+            echo "need_full_test=true" >> $GITHUB_OUTPUT
+            echo "skip_all=false" >> $GITHUB_OUTPUT
+          else
+            echo "ℹ️ No new source files. Will rely on mapping for incremental testing."
+            # 这里不直接设置路径，留给后续的 detect affected tests 步骤处理
+            echo "use_mapping=true" >> $GITHUB_OUTPUT
+          fi
           
           echo "=========================================="
 
-      # ==================== 检测受影响测试 ====================
+      # ==================== 仅在非强制全量模式下运行映射检测 ====================
       - name: Detect affected tests using global mapping
         id: affected
+        if: steps.determine_scope.outputs.use_mapping == 'true'
         run: |
           set -x
           echo "=========================================="
-          echo "🔍 STARTING AFFECTED TESTS DETECTION"
+          echo "🔍 STARTING AFFECTED TESTS DETECTION (Incremental Mode)"
           echo "=========================================="
-          
-          # 如果没有映射文件，触发全量测试
-          if [ ! -f ".global_test_mapping.json" ] || [ ! -s ".global_test_mapping.json" ]; then
-            echo "⚠️ No mapping file available, running full test"
-            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
-            echo "skip_all=false" >> $GITHUB_OUTPUT
-            echo "need_full_test=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
           
           SCRIPT_PATH=$(find .github/scripts -maxdepth 1 -type f -name "*detect*affected*.py" -print -quit)
           if [ -z "$SCRIPT_PATH" ]; then
@@ -371,25 +380,27 @@ jobs:
             exit 0
           fi
           
-          echo "CHANGED_FILES_PATH: $CHANGED_FILES_PATH"
-          python "$SCRIPT_PATH" > detection_output.txt 2>&1
-          SCRIPT_EXIT_CODE=$?
-          
-          echo "Detection script output:"
-          cat detection_output.txt
-          
-          if [ $SCRIPT_EXIT_CODE -ne 0 ]; then
-            echo "❌ Script failed, full test"
+          if [ ! -f ".global_test_mapping.json" ] || [ ! -s ".global_test_mapping.json" ]; then
+            echo "❌ Mapping missing, full test"
             echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
             echo "skip_all=false" >> $GITHUB_OUTPUT
             echo "need_full_test=true" >> $GITHUB_OUTPUT
             exit 0
           fi
           
-          # 检查是否有缺失测试的源码文件
-          MISSING_TESTS="${{ needs.early-detection.outputs.missing_tests }}"
-          if [ "$MISSING_TESTS" = "true" ]; then
-            echo "⚠️ Missing tests detected for new source files, forcing full test"
+          # 准备变更文件
+          COMPARE_SHA="${{ needs.early-detection.outputs.compare_sha }}"
+          CHANGED_FILES=$(git diff --name-only $COMPARE_SHA ${{ github.sha }})
+          echo "$CHANGED_FILES" > /tmp/changed_files.txt
+          echo "CHANGED_FILES_PATH=/tmp/changed_files.txt" >> $GITHUB_ENV
+          
+          python "$SCRIPT_PATH" > detection_output.txt 2>&1
+          SCRIPT_EXIT_CODE=$?
+          
+          cat detection_output.txt
+          
+          if [ $SCRIPT_EXIT_CODE -ne 0 ]; then
+            echo "❌ Script failed, full test"
             echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
             echo "skip_all=false" >> $GITHUB_OUTPUT
             echo "need_full_test=true" >> $GITHUB_OUTPUT
@@ -401,28 +412,47 @@ jobs:
           grep "need_full_test=" detection_output.txt >> $GITHUB_OUTPUT || echo "need_full_test=true" >> $GITHUB_OUTPUT
           
           echo "=========================================="
-          echo "✅ FINISHED AFFECTED TESTS DETECTION"
-          echo "=========================================="
 
       - name: Debug affected outputs
         run: |
-          echo "skip_all: ${{ steps.affected.outputs.skip_all }}"
-          echo "selected_paths: ${{ steps.affected.outputs.selected_paths }}"
-          echo "need_full_test: ${{ steps.affected.outputs.need_full_test }}"
+          echo "Force Full Test: ${{ needs.early-detection.outputs.force_full_test }}"
+          echo "Skip All: ${{ steps.affected.outputs.skip_all }}"
+          echo "Selected Paths: ${{ steps.affected.outputs.selected_paths }}"
+          echo "Need Full Test: ${{ steps.affected.outputs.need_full_test }}"
 
       - name: Check if should skip
         id: step_check_skip
-        run: echo "skip_all=${{ steps.affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
+        run: |
+          # 如果强制全量，绝不跳过
+          if [ "${{ needs.early-detection.outputs.force_full_test }}" == "true" ]; then
+            echo "skip_all=false" >> $GITHUB_OUTPUT
+          else
+            echo "skip_all=${{ steps.affected.outputs.skip_all }}" >> $GITHUB_OUTPUT
+          fi
 
       # ==================== 运行测试 ====================
       - name: Run tests via pytest
         if: steps.step_check_skip.outputs.skip_all != 'true'
         timeout-minutes: 180
         run: |
-          echo "🚀 STARTING PYTEST WITH GLOBAL MAPPING-BASED SELECTION"
-          echo "Selected paths: ${{ steps.affected.outputs.selected_paths }}"
+          echo "🚀 STARTING PYTEST"
+          echo "============================================="
+          
+          # 如果是强制全量，或者映射检测返回全量，则运行所有测试
+          if [ "${{ needs.early-detection.outputs.force_full_test }}" == "true" ] || [ "${{ steps.affected.outputs.need_full_test }}" == "true" ]; then
+            echo "MODE: FULL TEST SUITE"
+            SELECTED_PATHS="source/tests"
+          else
+            echo "MODE: INCREMENTAL TEST"
+            SELECTED_PATHS="${{ steps.affected.outputs.selected_paths }}"
+          fi
+          
+          echo "Selected paths: $SELECTED_PATHS"
+          
           export PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH
-          pytest -vv --cov=deepmd ${{ steps.affected.outputs.selected_paths }} \
+          echo "PYTHONPATH configured: $PYTHONPATH"
+          
+          pytest -vv --cov=deepmd $SELECTED_PATHS \
             --splits 12 --group ${{ matrix.group }} \
             --store-durations --clean-durations \
             --durations-path=.test_durations \
