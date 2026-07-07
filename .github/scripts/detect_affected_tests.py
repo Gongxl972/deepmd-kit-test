@@ -1,100 +1,140 @@
 #!/usr/bin/env python3
+"""
+Detect affected tests based on changed files and global mapping.
+"""
 import json
 import os
 import sys
 
+def debug(msg):
+    """Print debug message to stderr so it doesn't mix with output parsing."""
+    print(f"DEBUG: {msg}", file=sys.stderr)
+
 def main():
-    # 优先从文件读取变更文件列表
+    # ========== 1. Read changed files (Priority order) ==========
     changed_files = []
-    path = os.environ.get("CHANGED_FILES_PATH")
-    if path and os.path.exists(path):
-        print(f"DEBUG: Reading changed files from file: {path}")
-        with open(path, "r") as f:
-            changed_files = [line.strip() for line in f if line.strip()]
-    else:
-        # 回退到单行环境变量
+    
+    # Priority 1: Read from file (most reliable, passed from workflow)
+    changed_files_path = os.environ.get("CHANGED_FILES_PATH")
+    debug(f"CHANGED_FILES_PATH={changed_files_path}")
+    
+    if changed_files_path and os.path.exists(changed_files_path):
+        debug(f"Reading changed files from file: {changed_files_path}")
+        try:
+            with open(changed_files_path, "r") as f:
+                content = f.read()
+                debug(f"Raw file content: {repr(content)}")
+                changed_files = [line.strip() for line in content.splitlines() if line.strip()]
+        except Exception as e:
+            debug(f"Failed to read file: {e}")
+    
+    # Priority 2: Read from single-line environment variable
+    if not changed_files:
         raw = os.environ.get("CHANGED_FILES_SINGLELINE", "")
+        debug(f"CHANGED_FILES_SINGLELINE={repr(raw)}")
         if raw:
             changed_files = raw.split()
     
-    print(f"DEBUG: Parsed changed files ({len(changed_files)}):")
-    for f in changed_files:
-        print(f"  - {f}")
-
+    # Priority 3: Fallback to old CHANGED_FILES variable
     if not changed_files:
-        print("No changed files found.")
+        raw = os.environ.get("CHANGED_FILES", "")
+        debug(f"CHANGED_FILES={repr(raw)}")
+        if raw:
+            # Handle both newline and space separated formats
+            if "\n" in raw:
+                changed_files = [line.strip() for line in raw.splitlines() if line.strip()]
+            else:
+                changed_files = raw.split()
+    
+    debug(f"Parsed changed files ({len(changed_files)}):")
+    for cf in changed_files:
+        debug(f"  - {cf}")
+    
+    # If no changed files, trigger full test (safe default)
+    if not changed_files:
+        debug("No changed files found, falling back to full test")
         print("selected_paths=source/tests")
         print("skip_all=false")
         print("need_full_test=true")
         sys.exit(0)
-
-    # 加载全局映射
+    
+    # ========== 2. Load global mapping ==========
     mapping_path = ".global_test_mapping.json"
+    debug(f"Loading mapping from: {mapping_path}")
+    
     if not os.path.exists(mapping_path):
-        print(f"Mapping file {mapping_path} not found, fallback to full test.")
+        debug(f"Mapping file not found, falling back to full test")
         print("selected_paths=source/tests")
         print("skip_all=false")
         print("need_full_test=true")
         sys.exit(0)
     
-    with open(mapping_path, "r") as f:
-        try:
+    try:
+        with open(mapping_path, "r") as f:
             mapping = json.load(f)
-        except json.JSONDecodeError:
-            print("Invalid mapping JSON, fallback to full test.")
-            print("selected_paths=source/tests")
-            print("skip_all=false")
-            print("need_full_test=true")
-            sys.exit(0)
+    except json.JSONDecodeError as e:
+        debug(f"Invalid JSON in mapping file: {e}")
+        print("selected_paths=source/tests")
+        print("skip_all=false")
+        print("need_full_test=true")
+        sys.exit(0)
     
-    # 过滤掉metadata字段
+    # Filter out metadata field
     mapping = {k: v for k, v in mapping.items() if k != "metadata"}
-    print(f"DEBUG: Loaded {len(mapping)} test mappings (excluded metadata)")
+    debug(f"Loaded {len(mapping)} test mappings (excluded metadata)")
     
-    # 匹配变更文件和测试
+    # ========== 3. Match changed files to tests ==========
     affected_tests = set()
     new_source_files_without_tests = []
     
     for cf in changed_files:
-        print(f"DEBUG: Processing changed file: {cf}")
+        debug(f"Processing changed file: {cf}")
         
-        # 情况A：变更的是测试文件，直接加入待运行列表
+        # Case A: Changed file is a test file itself
         if cf.startswith("source/tests/"):
-            print(f"DEBUG: Changed file is a test file, adding to affected tests: {cf}")
+            debug(f"Changed file is a test file, adding to affected tests: {cf}")
             affected_tests.add(cf)
             continue
         
-        # 情况B：变更的是源码文件，去映射里找依赖它的测试
-        found_match = False
-        for test_file, meta in mapping.items():
-            dependencies = meta.get("dependencies", [])
-            if cf in dependencies:
-                print(f"DEBUG: Found test {test_file} depends on {cf}, adding to affected tests")
-                affected_tests.add(test_file)
-                found_match = True
+        # Case B: Changed file is a workflow/config file - trigger full test
+        if cf.startswith(".github/workflows/") or cf.startswith(".github/scripts/"):
+            debug(f"Changed workflow/script file {cf}, triggering full test")
+            print("selected_paths=source/tests")
+            print("skip_all=false")
+            print("need_full_test=true")
+            sys.exit(0)
         
-        # 情况C：变更的是源码文件，但没有测试依赖它
-        if not found_match and cf.startswith("source/deepmd/"):
-            print(f"DEBUG: Changed source file {cf} has no test coverage, marking for full test")
-            new_source_files_without_tests.append(cf)
+        # Case C: Changed file is a source file, look for dependent tests
+        if cf.startswith("source/deepmd/"):
+            found_match = False
+            for test_file, meta in mapping.items():
+                dependencies = meta.get("dependencies", [])
+                if cf in dependencies:
+                    debug(f"Found test {test_file} depends on {cf}, adding to affected tests")
+                    affected_tests.add(test_file)
+                    found_match = True
+            
+            if not found_match:
+                debug(f"Changed source file {cf} has no test coverage, marking for full test")
+                new_source_files_without_tests.append(cf)
     
-    # 输出最终结果
+    # ========== 4. Output results ==========
     if new_source_files_without_tests:
-        # 新增源码无测试覆盖，主动触发全量测试
-        print(f"New source files without test coverage: {new_source_files_without_tests}")
+        # New source files without test coverage -> full test
+        debug(f"New source files without test coverage: {new_source_files_without_tests}")
         print("selected_paths=source/tests")
         print("skip_all=false")
         print("need_full_test=true")
     elif affected_tests:
-        # 匹配到受影响的测试，只运行这些测试
+        # Found affected tests -> run only those
         selected = " ".join(sorted(affected_tests))
-        print(f"Affected tests found: {selected}")
+        debug(f"Affected tests found: {selected}")
         print(f"selected_paths={selected}")
         print("skip_all=false")
         print("need_full_test=false")
     else:
-        # 没有匹配到任何测试，且没有新增源码，跳过测试
-        print("No affected tests found and no new source files.")
+        # No affected tests and no new source files -> skip tests
+        debug("No affected tests found and no new source files")
         print("selected_paths=")
         print("skip_all=true")
         print("need_full_test=false")
