@@ -376,11 +376,23 @@ jobs:
             exit 0
           fi
           
-          # 设置环境变量供脚本使用
-          echo "CHANGED_FILES<<EOF" >> $GITHUB_ENV
-          echo "$CHANGED_FILES" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+          # ✅✅✅ 关键修复：改用文件传递，彻底解决 <<EOF 问题 ✅✅✅
+          # 将变更文件列表写入临时文件（最可靠的方式）
+          echo "$CHANGED_FILES" > /tmp/changed_files.txt
+          echo "CHANGED_FILES_PATH=/tmp/changed_files.txt" >> $GITHUB_ENV
+          
+          # 同时提供单行环境变量作为备用（用空格分隔）
+          CHANGED_FILES_SINGLELINE=$(echo "$CHANGED_FILES" | tr '\n' ' ')
+          echo "CHANGED_FILES_SINGLELINE=$CHANGED_FILES_SINGLELINE" >> $GITHUB_ENV
+          
+          # 保留旧的环境变量名称以保持兼容性（但使用单行格式）
+          echo "CHANGED_FILES=$CHANGED_FILES_SINGLELINE" >> $GITHUB_ENV
+          
           echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
+          
+          echo "✅ Written changed files to /tmp/changed_files.txt"
+          echo "First few lines of /tmp/changed_files.txt:"
+          head -5 /tmp/changed_files.txt
           
           # 运行检测脚本
           echo "Running detection script..."
