@@ -272,6 +272,72 @@ jobs:
           echo "✅ TEST FILES COLLECTION COMPLETE"
           echo "=========================================="
 
+      # ==================== 新增：准备变更文件数据（独立 Step）====================
+      - name: Prepare changed files for detection
+        id: prepare_changed
+        run: |
+          set -x
+          echo "=========================================="
+          echo "📝 PREPARING CHANGED FILES FOR DETECTION"
+          echo "=========================================="
+          
+          # Base SHA 逻辑
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          elif git show-ref --verify --quiet refs/remotes/origin/main; then
+            BASE_SHA=$(git merge-base HEAD origin/main)
+          elif git show-ref --verify --quiet refs/remotes/origin/master; then
+            BASE_SHA=$(git merge-base HEAD origin/master)
+          else
+            BASE_SHA="HEAD~1"
+          fi
+          
+          # 对于 Push 事件，比较当前提交和父提交
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            COMPARE_SHA="${{ github.sha }}^"
+            echo "Push event: comparing ${{ github.sha }} with parent"
+          else
+            COMPARE_SHA=$BASE_SHA
+            echo "Non-push event: comparing with $COMPARE_SHA"
+          fi
+          
+          # 获取变更文件列表
+          CHANGED_FILES=$(git diff --name-only $COMPARE_SHA ${{ github.sha }}) ; DIFF_EXIT_CODE=$?
+          echo "Git diff exit code: $DIFF_EXIT_CODE"
+          
+          # 如果 git diff 失败，标记无变更
+          if [ $DIFF_EXIT_CODE -ne 0 ]; then
+            echo "❌ git diff failed, assuming no changes"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "CHANGED_FILES_PATH=" >> $GITHUB_ENV
+            echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
+            exit 0
+          fi
+          
+          # 打印变更文件列表
+          echo "Changed files:"
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "$CHANGED_FILES"
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "(none)"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # 将变更文件列表写入临时文件
+          echo "$CHANGED_FILES" > /tmp/changed_files.txt
+          echo "CHANGED_FILES_PATH=/tmp/changed_files.txt" >> $GITHUB_ENV
+          echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
+          
+          echo "✅ Written changed files to /tmp/changed_files.txt"
+          echo "First few lines of /tmp/changed_files.txt:"
+          head -5 /tmp/changed_files.txt
+          
+          echo "=========================================="
+          echo "✅ CHANGED FILES PREPARED"
+          echo "=========================================="
+
+      # ==================== 修改：检测受影响测试（现在能读到环境变量了）====================
       - name: Detect affected tests using global mapping
         id: affected
         run: |
@@ -320,55 +386,8 @@ jobs:
           echo "First few keys in mapping:"
           jq -r 'keys[:3][]' .global_test_mapping.json 2>/dev/null || echo "Failed to parse JSON"
           
-          # Base SHA 逻辑
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          elif git show-ref --verify --quiet refs/remotes/origin/main; then
-            BASE_SHA=$(git merge-base HEAD origin/main)
-          elif git show-ref --verify --quiet refs/remotes/origin/master; then
-            BASE_SHA=$(git merge-base HEAD origin/master)
-          else
-            BASE_SHA="HEAD~1"
-          fi
-          echo "Base SHA: $BASE_SHA"
-          echo "Current SHA: ${{ github.sha }}"
-          
-          # ✅ 关键修复：使用正确的比较方式
-          # 对于 Push 事件，比较当前提交和上一个提交
-          # 对于 PR 事件，比较 PR 的 base 和 head
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            # Push 事件：比较当前提交和父提交
-            COMPARE_SHA="${{ github.sha }}^"
-            echo "Push event: comparing ${{ github.sha }} with parent"
-          else
-            # PR 事件：使用 base.sha
-            COMPARE_SHA=$BASE_SHA
-            echo "Non-push event: comparing with $COMPARE_SHA"
-          fi
-          
-          # 获取变更文件列表
-          CHANGED_FILES=$(git diff --name-only $COMPARE_SHA ${{ github.sha }}) ; DIFF_EXIT_CODE=$?
-          echo "Git diff exit code: $DIFF_EXIT_CODE"
-          
-          # 如果 git diff 失败，回退到全量测试
-          if [ $DIFF_EXIT_CODE -ne 0 ]; then
-            echo "❌ git diff failed with exit code $DIFF_EXIT_CODE. Falling back to full test."
-            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
-            echo "skip_all=false" >> $GITHUB_OUTPUT
-            echo "need_full_test=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          # 打印变更文件列表
-          echo "Changed files:"
-          if [ -n "$CHANGED_FILES" ]; then
-            echo "$CHANGED_FILES"
-          else
-            echo "(none)"
-          fi
-          
           # 如果没有变更，跳过测试
-          if [ -z "$CHANGED_FILES" ]; then
+          if [ "${{ steps.prepare_changed.outputs.has_changes }}" != "true" ]; then
             echo "❌ NO FILES CHANGED - Skipping tests"
             echo "skip_all=true" >> $GITHUB_OUTPUT
             echo "selected_paths=" >> $GITHUB_OUTPUT
@@ -376,23 +395,9 @@ jobs:
             exit 0
           fi
           
-          # ✅✅✅ 关键修复：改用文件传递，彻底解决 <<EOF 问题 ✅✅✅
-          # 将变更文件列表写入临时文件（最可靠的方式）
-          echo "$CHANGED_FILES" > /tmp/changed_files.txt
-          echo "CHANGED_FILES_PATH=/tmp/changed_files.txt" >> $GITHUB_ENV
-          
-          # 同时提供单行环境变量作为备用（用空格分隔）
-          CHANGED_FILES_SINGLELINE=$(echo "$CHANGED_FILES" | tr '\n' ' ')
-          echo "CHANGED_FILES_SINGLELINE=$CHANGED_FILES_SINGLELINE" >> $GITHUB_ENV
-          
-          # 保留旧的环境变量名称以保持兼容性（但使用单行格式）
-          echo "CHANGED_FILES=$CHANGED_FILES_SINGLELINE" >> $GITHUB_ENV
-          
-          echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
-          
-          echo "✅ Written changed files to /tmp/changed_files.txt"
-          echo "First few lines of /tmp/changed_files.txt:"
-          head -5 /tmp/changed_files.txt
+          echo "✅ Changes detected, running detection script..."
+          echo "CHANGED_FILES_PATH: $CHANGED_FILES_PATH"
+          echo "BASE_SHA: $BASE_SHA"
           
           # 运行检测脚本
           echo "Running detection script..."
