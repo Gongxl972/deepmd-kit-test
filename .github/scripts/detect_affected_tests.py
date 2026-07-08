@@ -5,10 +5,52 @@ Detect affected tests based on changed files and global mapping.
 import json
 import os
 import sys
+import subprocess
 
 def debug(msg):
     """Print debug message to stderr so it doesn't mix with output parsing."""
     print(f"DEBUG: {msg}", file=sys.stderr)
+
+def get_changed_files_from_git():
+    """Fallback: get changed files directly from git diff."""
+    debug("Attempting to get changed files from git diff...")
+    
+    # Get base SHA from environment (set by workflow)
+    base_sha = os.environ.get("COMPARE_SHA")
+    if not base_sha:
+        debug("COMPARE_SHA not found in environment")
+        # Try alternative environment variables
+        base_sha = os.environ.get("GITHUB_BASE_SHA")
+        if not base_sha:
+            # Last resort: use HEAD~1
+            base_sha = "HEAD~1"
+            debug(f"Using fallback base SHA: {base_sha}")
+    
+    # Get current SHA
+    current_sha = os.environ.get("GITHUB_SHA", "HEAD")
+    debug(f"Git diff range: {base_sha}..{current_sha}")
+    
+    try:
+        # Run git diff to get changed files
+        result = subprocess.run(
+            ["git", "diff", "--name-only", base_sha, current_sha],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        changed_files = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        debug(f"Git diff returned {len(changed_files)} changed files")
+        for cf in changed_files:
+            debug(f"  - {cf}")
+        return changed_files
+        
+    except subprocess.CalledProcessError as e:
+        debug(f"Git diff failed: {e.stderr}")
+        return []
+    except Exception as e:
+        debug(f"Error running git diff: {e}")
+        return []
 
 def main():
     # ========== 1. Read changed files (Priority order) ==========
@@ -46,13 +88,18 @@ def main():
             else:
                 changed_files = raw.split()
     
+    # Priority 4: Fallback to git diff (NEW - most reliable when env vars fail)
+    if not changed_files:
+        debug("No changed files found via environment variables, trying git diff...")
+        changed_files = get_changed_files_from_git()
+    
     debug(f"Parsed changed files ({len(changed_files)}):")
     for cf in changed_files:
         debug(f"  - {cf}")
     
     # If no changed files, trigger full test (safe default)
     if not changed_files:
-        debug("No changed files found, falling back to full test")
+        debug("No changed files found after all attempts, falling back to full test")
         print("selected_paths=source/tests")
         print("skip_all=false")
         print("need_full_test=true")
