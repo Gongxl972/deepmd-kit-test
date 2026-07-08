@@ -41,6 +41,14 @@ jobs:
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             BASE_SHA="${{ github.event.pull_request.base.sha }}"
             COMPARE_SHA=$BASE_SHA
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            # ✅ 使用官方提供的 before SHA，这是最准确的
+            BASE_SHA="${{ github.event.before }}"
+            # 防御：首次推送时 before 是全0，兜底用父提交
+            if [[ "$BASE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+              BASE_SHA="${{ github.sha }}^"
+            fi
+            COMPARE_SHA=$BASE_SHA
           else
             BASE_SHA=$(git merge-base HEAD origin/master)
             COMPARE_SHA="${{ github.sha }}^"
@@ -156,6 +164,12 @@ jobs:
           
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            # ✅ 同样使用官方提供的 before SHA
+            BASE_SHA="${{ github.event.before }}"
+            if [[ "$BASE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+              BASE_SHA="${{ github.sha }}^"
+            fi
           elif git show-ref --verify --quiet refs/remotes/origin/main; then
             BASE_SHA=$(git merge-base HEAD origin/main)
           elif git show-ref --verify --quiet refs/remotes/origin/master; then
