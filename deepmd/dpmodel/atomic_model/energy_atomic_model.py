@@ -13,7 +13,7 @@ from .dp_atomic_model import (
 )
 
 
-class DPEnergyAtomicModel(DPAtomicModel):
+#class DPEnergyAtomicModel(DPAtomicModel):
     def __init__(
         self, descriptor: Any, fitting: Any, type_map: list[str], **kwargs: Any
     ) -> None:
