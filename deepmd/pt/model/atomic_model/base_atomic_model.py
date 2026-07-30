@@ -418,6 +418,35 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             charge_spin=charge_spin,
         )
 
+    def has_embedding(self) -> bool:
+        """Whether this atomic model can produce ``forward_embedding`` outputs.
+
+        False for atomic models without a descriptor-fitting pair (e.g. a pure
+        tabulated pair potential); linear combinations report True when any
+        sub-model supports it.
+        """
+        return False
+
+    def forward_embedding(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor | None = None,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+        charge_spin: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Extract model embeddings; only implemented by descriptor-fitting models.
+
+        Defined here so the model-level ``forward_embedding`` (and TorchScript)
+        always resolves the call; atomic models without a fitting net (e.g. a
+        pure tabulated pair potential) inherit this guard.
+        """
+        raise NotImplementedError(
+            "forward_embedding is not supported for this atomic model."
+        )
+
     def change_type_map(
         self,
         type_map: list[str],
@@ -591,7 +620,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             delta_bias, out_std = compute_output_stats(
                 sample_merged,
                 self.get_ntypes(),
-                keys=list(self.atomic_output_def().keys()),
+                keys=self.bias_keys,
                 stat_file_path=stat_file_path,
                 model_forward=self._get_forward_wrapper_func(),
                 rcond=self.rcond,
@@ -604,7 +633,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             bias_out, std_out = compute_output_stats(
                 sample_merged,
                 self.get_ntypes(),
-                keys=list(self.atomic_output_def().keys()),
+                keys=self.bias_keys,
                 stat_file_path=stat_file_path,
                 rcond=self.rcond,
                 preset_bias=self.preset_out_bias,

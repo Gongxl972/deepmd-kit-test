@@ -8,6 +8,7 @@ from collections.abc import (
     Callable,
     Generator,
     Iterable,
+    Mapping,
 )
 from contextlib import (
     nullcontext,
@@ -28,6 +29,9 @@ import torch
 from deepmd.common import (
     symlink_prefix_files,
 )
+from deepmd.dpmodel.train import (
+    change_model_out_bias,
+)
 from deepmd.dpmodel.utils import (
     compute_total_numb_batch,
     resolve_model_prob,
@@ -44,6 +48,7 @@ from deepmd.pt.loss import (
     EnergyHessianStdLoss,
     EnergySpinLoss,
     EnergyStdLoss,
+    PopulationLoss,
     PropertyLoss,
     TaskLoss,
     TensorLoss,
@@ -75,6 +80,9 @@ from deepmd.pt.train.ema import (
 from deepmd.pt.train.utils import (
     NonFiniteGradGuard,
     clip_grad_norm_,
+    latest_checkpoint_path,
+    resolve_best_checkpoint_dir,
+    resolve_keep_ckpt_count,
     scoped_env_defaults,
 )
 from deepmd.pt.train.validation import (
@@ -115,6 +123,9 @@ from deepmd.pt.utils.utils import (
 from deepmd.utils.data import (
     DataRequirementItem,
 )
+from deepmd.utils.finetune import (
+    warn_configuration_mismatch_during_finetune,
+)
 
 if torch.__version__.startswith("2"):
     import torch._dynamo
@@ -141,8 +152,11 @@ from torch.utils.data import (
     DataLoader,
 )
 
-from deepmd.utils.path import (
-    DPH5Path,
+from deepmd.utils.stat_file import (
+    StatFileSpec,
+    open_stat_file,
+    run_stat_on_chief,
+    stat_file_specs_by_task,
 )
 
 log = logging.getLogger(__name__)
@@ -153,7 +167,7 @@ class Trainer:
         self,
         config: dict[str, Any],
         training_data: DpLoaderSet,
-        stat_file_path: str | None = None,
+        stat_file_spec: StatFileSpec | Mapping[str, StatFileSpec] | None = None,
         validation_data: DpLoaderSet | None = None,
         init_model: str | None = None,
         restart_model: str | None = None,
@@ -177,6 +191,7 @@ class Trainer:
         else:
             resume_model = None
         resuming = resume_model is not None
+        has_initial_state = resuming or init_frz_model is not None
         self.restart_training = restart_model is not None
         model_params = config["model"]
         training_params = config["training"]
@@ -188,9 +203,13 @@ class Trainer:
             infer_env_defaults["DP_COMPILE_INFER"] = "1"
         if bool(validating_params.get("tf32_infer", False)):
             infer_env_defaults["DP_TF32_INFER"] = "1"
+        if bool(validating_params.get("amp_infer", False)):
+            infer_env_defaults["DP_AMP_INFER"] = "1"
         self.multi_task = "model_dict" in model_params
         self.finetune_links = finetune_links
-        self.finetune_update_stat = False
+        finetune_updates_statistics = finetune_links is not None and any(
+            rule.get_has_new_type() for rule in finetune_links.values()
+        )
         self.model_keys = (
             list(model_params["model_dict"]) if self.multi_task else ["Default"]
         )
@@ -199,6 +218,10 @@ class Trainer:
         self.world_size = dist.get_world_size() if self.is_distributed else 1
         self.num_model = len(self.model_keys)
         self.model_prob = None
+        self.stat_file_specs = stat_file_specs_by_task(
+            stat_file_spec,
+            self.model_keys,
+        )
 
         # Iteration config
         self.num_steps = training_params.get("numb_steps")
@@ -208,8 +231,13 @@ class Trainer:
         self.disp_freq = training_params.get("disp_freq", 1000)
         self.disp_avg = training_params.get("disp_avg", False)
         self.save_ckpt = training_params.get("save_ckpt", "model.ckpt")
+        save_dir = training_params.get("save_dir")
+        self.save_dir = Path(save_dir) if save_dir else None
+        if self.save_dir is not None and self.rank == 0:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
         self.save_freq = training_params.get("save_freq", 1000)
         self.max_ckpt_keep = training_params.get("max_ckpt_keep", 5)
+        self.ckpt_keep_ratio = training_params.get("ckpt_keep_ratio")
         self.enable_ema = bool(training_params.get("enable_ema", False))
         self.ema_decay = float(training_params.get("ema_decay", 0.999))
         self.ema_ckpt_keep = int(training_params.get("ema_ckpt_keep", 3))
@@ -312,7 +340,7 @@ class Trainer:
                         rank=self.rank,
                         world_size=self.world_size,
                         shuffle=True,
-                        seed=_training_params.get("seed", None),
+                        seed=_training_params.get("seed"),
                         block_targets=_block_targets,
                     )
                 else:
@@ -396,7 +424,7 @@ class Trainer:
             _model: Any,
             _data_stat_nbatch: int,
             _training_data: DpLoaderSet,
-            _stat_file_path: str | None,
+            _stat_file_spec: StatFileSpec,
             finetune_has_new_type: bool = False,
             preset_observed_type: list[str] | None = None,
         ) -> Callable[[], Any]:
@@ -409,14 +437,20 @@ class Trainer:
                 )
                 return sampled
 
-            if (not resuming or finetune_has_new_type) and self.rank == 0:
-                _model.compute_or_load_stat(
-                    sampled_func=get_sample,
-                    stat_file_path=_stat_file_path,
-                    preset_observed_type=preset_observed_type,
+            if not has_initial_state or finetune_has_new_type:
+
+                def initialize_statistics() -> None:
+                    with open_stat_file(_stat_file_spec) as stat_file_path:
+                        _model.compute_or_load_stat(
+                            sampled_func=get_sample,
+                            stat_file_path=stat_file_path,
+                            preset_observed_type=preset_observed_type,
+                        )
+
+                self._run_stat_on_chief(
+                    initialize_statistics,
+                    operation="statistics initialization",
                 )
-                if isinstance(_stat_file_path, DPH5Path):
-                    _stat_file_path.root.close()
             return get_sample
 
         def get_lr(lr_params: dict[str, Any]) -> BaseLR:
@@ -506,7 +540,7 @@ class Trainer:
                 self.model,
                 model_params.get("data_stat_nbatch", 10),
                 training_data,
-                stat_file_path,
+                self.stat_file_specs["Default"],
                 finetune_has_new_type=self.finetune_links["Default"].get_has_new_type()
                 if self.finetune_links is not None
                 else False,
@@ -586,7 +620,7 @@ class Trainer:
                     self.model[model_key],
                     model_params["model_dict"][model_key].get("data_stat_nbatch", 10),
                     training_data[model_key],
-                    stat_file_path[model_key],
+                    self.stat_file_specs[model_key],
                     finetune_has_new_type=self.finetune_links[
                         model_key
                     ].get_has_new_type()
@@ -723,6 +757,24 @@ class Trainer:
                     rank=self.rank,
                 )
 
+        # === Derive checkpoint retention from ckpt_keep_ratio ===
+        # num_steps is final here (including when derived from num_epoch), so the
+        # ratio can be converted into an absolute keep count once.
+        keep_ckpt_count = resolve_keep_ckpt_count(
+            self.ckpt_keep_ratio, self.num_steps, self.save_freq
+        )
+        if keep_ckpt_count is not None:
+            self.max_ckpt_keep = keep_ckpt_count
+            self.ema_ckpt_keep = keep_ckpt_count
+            log.info(
+                "Resolved checkpoint retention to %d from ckpt_keep_ratio=%s "
+                "(num_steps=%d, save_freq=%d).",
+                keep_ckpt_count,
+                self.ckpt_keep_ratio,
+                self.num_steps,
+                self.save_freq,
+            )
+
         # Learning rate
         self.gradient_max_norm = training_params.get("gradient_max_norm", 0.0)
         self.nonfinite_grad_guard = NonFiniteGradGuard()
@@ -793,9 +845,8 @@ class Trainer:
                     new_state_dict = {}
                     target_state_dict = self.wrapper.state_dict()
                     # pretrained_model
-                    pretrained_model = get_model_for_wrapper(
-                        state_dict["_extra_state"]["model_params"]
-                    )
+                    pretrained_model_params = state_dict["_extra_state"]["model_params"]
+                    pretrained_model = get_model_for_wrapper(pretrained_model_params)
                     pretrained_model_wrapper = ModelWrapper(pretrained_model)
                     pretrained_model_wrapper.load_state_dict(state_dict)
                     # update type related params
@@ -811,7 +862,6 @@ class Trainer:
                         ):
                             model_with_new_type_stat = None
                             if finetune_rule_single.get_has_new_type():
-                                self.finetune_update_stat = True
                                 model_with_new_type_stat = self.wrapper.model[model_key]
                             pretrained_model_wrapper.model[
                                 _model_key_from
@@ -830,6 +880,25 @@ class Trainer:
                     ) -> None:
                         _new_fitting = _finetune_rule_single.get_random_fitting()
                         _model_key_from = _finetune_rule_single.get_model_branch()
+                        _input_model_params = (
+                            model_params["model_dict"][_model_key]
+                            if self.multi_task
+                            else model_params
+                        )
+                        _pretrained_model_params = (
+                            pretrained_model_params["model_dict"][_model_key_from]
+                            if "model_dict" in pretrained_model_params
+                            else pretrained_model_params
+                        )
+                        if (
+                            "descriptor" in _input_model_params
+                            and "descriptor" in _pretrained_model_params
+                        ):
+                            warn_configuration_mismatch_during_finetune(
+                                _input_model_params["descriptor"],
+                                _pretrained_model_params["descriptor"],
+                                _model_key_from,
+                            )
                         target_keys = [
                             i
                             for i in _random_state_dict.keys()
@@ -886,44 +955,45 @@ class Trainer:
                 state_dict["_extra_state"] = self.wrapper.state_dict()["_extra_state"]
                 self.wrapper.load_state_dict(state_dict)
 
-                # change bias for fine-tuning
-                if finetune_model is not None:
+            if finetune_model is not None:
+                for model_key in self.model_keys:
+                    finetune_rule = self.finetune_links[model_key]
+                    if self.multi_task and finetune_rule.get_resuming():
+                        if self.rank == 0:
+                            log.info("Model branch %s will resume training.", model_key)
+                        continue
+                    if self.multi_task and self.rank == 0:
+                        log.info(
+                            "Model branch %s will be fine-tuned. "
+                            "This may take a long time...",
+                            model_key,
+                        )
 
-                    def single_model_finetune(
-                        _model: Any,
-                        _finetune_rule_single: Any,
-                        _sample_func: Callable,
-                    ) -> Any:
-                        _model = model_change_out_bias(
-                            _model,
-                            _sample_func,
+                    def update_finetune_bias(
+                        _model_key: str = model_key,
+                        _finetune_rule: Any = finetune_rule,
+                    ) -> None:
+                        model = (
+                            self.model[_model_key] if self.multi_task else self.model
+                        )
+                        model = model_change_out_bias(
+                            model,
+                            self.get_sample_func[_model_key]
+                            if self.multi_task
+                            else self.get_sample_func,
                             _bias_adjust_mode="change-by-statistic"
-                            if not _finetune_rule_single.get_random_fitting()
+                            if not _finetune_rule.get_random_fitting()
                             else "set-by-statistic",
                         )
-                        return _model
+                        if self.multi_task:
+                            self.model[_model_key] = model
+                        else:
+                            self.model = model
 
-                    if not self.multi_task:
-                        finetune_rule_single = self.finetune_links["Default"]
-                        self.model = single_model_finetune(
-                            self.model, finetune_rule_single, self.get_sample_func
-                        )
-                    else:
-                        for model_key in self.model_keys:
-                            finetune_rule_single = self.finetune_links[model_key]
-                            if not finetune_rule_single.get_resuming():
-                                log.info(
-                                    f"Model branch {model_key} will be fine-tuned. This may take a long time..."
-                                )
-                                self.model[model_key] = single_model_finetune(
-                                    self.model[model_key],
-                                    finetune_rule_single,
-                                    self.get_sample_func[model_key],
-                                )
-                            else:
-                                log.info(
-                                    f"Model branch {model_key} will resume training."
-                                )
+                    self._run_stat_on_chief(
+                        update_finetune_bias,
+                        operation=f"fine-tuning statistics for task {model_key!r}",
+                    )
 
         if init_frz_model is not None:
             frz_model = torch.jit.load(init_frz_model, map_location=DEVICE)
@@ -945,11 +1015,25 @@ class Trainer:
             assert np.allclose(_data_stat_protect, _data_stat_protect[0]), (
                 "Model key 'data_stat_protect' must be the same in each branch when multitask!"
             )
+            share_kwargs = {
+                "model_key_prob_map": dict(
+                    zip(self.model_keys, self.model_prob, strict=True)
+                ),
+                "data_stat_protect": _data_stat_protect[0],
+            }
+            if not has_initial_state or finetune_updates_statistics:
+                self._run_stat_on_chief(
+                    lambda: self.wrapper.share_params(
+                        shared_links,
+                        resume=False,
+                        **share_kwargs,
+                    ),
+                    operation="shared statistics merge",
+                )
             self.wrapper.share_params(
                 shared_links,
-                resume=(resuming and not self.finetune_update_stat) or self.rank != 0,
-                model_key_prob_map=dict(zip(self.model_keys, self.model_prob)),
-                data_stat_protect=_data_stat_protect[0],
+                resume=True,
+                **share_kwargs,
             )
 
         # LoRA injection (single-task only; argcheck rejects multi-task).
@@ -1116,6 +1200,30 @@ class Trainer:
         if self.rank == 0:
             self._log_parameter_count()
 
+    def _run_stat_on_chief(
+        self,
+        action: Callable[[], None],
+        *,
+        operation: str,
+    ) -> None:
+        """Run a statistics action on rank 0 and synchronize its outcome."""
+        synchronize_failure: Callable[[bool], bool] | None = None
+        if self.is_distributed:
+
+            def broadcast_failure(failed: bool) -> bool:
+                holder = [failed if self.rank == 0 else False]
+                dist.broadcast_object_list(holder, src=0, device=DEVICE)
+                return bool(holder[0])
+
+            synchronize_failure = broadcast_failure
+
+        run_stat_on_chief(
+            action,
+            is_chief=self.rank == 0,
+            synchronize_failure=synchronize_failure,
+            operation=operation,
+        )
+
     def _broadcast_value_from_rank0(self, value: Any) -> Any:
         """Return rank 0's copy of ``value`` on every rank.
 
@@ -1172,7 +1280,9 @@ class Trainer:
             rank=self.rank,
             zero_stage=self.zero_stage,
             restart_training=self.restart_training,
-            checkpoint_dir=Path(self.save_ckpt).parent,
+            checkpoint_dir=resolve_best_checkpoint_dir(
+                validating_params, self.save_ckpt
+            ),
         )
 
     def _create_ema_full_validator(
@@ -1181,16 +1291,18 @@ class Trainer:
         validating_params: dict[str, Any],
         validation_data: DpLoaderSet | None,
     ) -> FullValidator | None:
-        """Create the runtime EMA full validator when it is active."""
-        if not self._is_validation_requested(
-            validating_params, "full_validation"
-        ) or not validating_params.get("ema_full_validation", False):
+        """Create the runtime EMA full validator when it is active.
+
+        EMA full validation is independent from regular full validation: it
+        can be enabled on its own to validate only the EMA-smoothed model.
+        """
+        if not self._is_validation_requested(validating_params, "ema_full_validation"):
+            return None
+        if self.model_ema is None:
+            # EMA full validation needs the EMA-smoothed model; when EMA is
+            # disabled the option is silently ignored rather than failing.
             return None
         self._raise_if_full_validation_unsupported(validation_data)
-        if self.model_ema is None:
-            raise ValueError(
-                "validating.ema_full_validation requires `training.enable_ema=true`."
-            )
         if validation_data is None:
             raise RuntimeError(
                 "validation_data must be available after EMA full validation checks."
@@ -1206,7 +1318,9 @@ class Trainer:
             rank=self.rank,
             zero_stage=self.zero_stage,
             restart_training=self.restart_training,
-            checkpoint_dir=Path(self.save_ckpt).parent,
+            checkpoint_dir=resolve_best_checkpoint_dir(
+                validating_params, self.save_ckpt
+            ),
             full_val_file=get_ema_validation_log_path(
                 validating_params.get("full_val_file", "val.log")
             ),
@@ -1240,18 +1354,10 @@ class Trainer:
                 "training; multi-task training is not supported."
             )
 
-        has_spin = getattr(self.model, "has_spin", False)
-        if callable(has_spin):
-            has_spin = has_spin()
-        if has_spin or isinstance(self.loss, EnergySpinLoss):
+        if not isinstance(self.loss, (EnergyStdLoss, EnergySpinLoss)):
             raise ValueError(
                 "validating.full_validation only supports single-task energy "
-                "training; spin-energy training is not supported."
-            )
-
-        if not isinstance(self.loss, EnergyStdLoss):
-            raise ValueError(
-                "validating.full_validation only supports single-task energy training."
+                "or spin-energy training."
             )
 
         if validation_data is None:
@@ -1795,21 +1901,25 @@ class Trainer:
                 self.zero_stage > 0 or self.rank == 0 or dist.get_rank() == 0
             ):
                 # Handle the case if rank 0 aborted and re-assigned
-                self.latest_model = Path(self.save_ckpt + f"-{display_step_id}.pt")
+                self.latest_model = latest_checkpoint_path(
+                    self.save_ckpt, display_step_id, self.save_dir
+                )
                 self.save_model(self.latest_model, lr=cur_lr, step=_step_id)
                 if self.rank == 0 or dist.get_rank() == 0:
                     log.info(f"Saved model to {self.latest_model}")
-                    symlink_prefix_files(self.latest_model.stem, self.save_ckpt)
+                    symlink_prefix_files(
+                        str(self.latest_model.with_suffix("")), self.save_ckpt
+                    )
                     with open("checkpoint", "w") as f:
                         f.write(str(self.latest_model))
                 if self.model_ema is not None:
-                    self.latest_ema_model = Path(
-                        self.ema_save_ckpt + f"-{display_step_id}.pt"
+                    self.latest_ema_model = latest_checkpoint_path(
+                        self.ema_save_ckpt, display_step_id, self.save_dir
                     )
                     self.save_ema_model(self.latest_ema_model, lr=cur_lr, step=_step_id)
                     if self.rank == 0 or dist.get_rank() == 0:
                         symlink_prefix_files(
-                            self.latest_ema_model.stem,
+                            str(self.latest_ema_model.with_suffix("")),
                             self.ema_save_ckpt,
                         )
 
@@ -1888,30 +1998,36 @@ class Trainer:
                         self.get_sample_func[model_key],
                         _bias_adjust_mode="change-by-statistic",
                     )
-            self.latest_model = Path(self.save_ckpt + f"-{self.num_steps}.pt")
+            self.latest_model = latest_checkpoint_path(
+                self.save_ckpt, self.num_steps, self.save_dir
+            )
             cur_lr = self.lr_schedule.value(self.num_steps - 1)
             self.save_model(self.latest_model, lr=cur_lr, step=self.num_steps - 1)
             log.info(f"Saved model to {self.latest_model}")
-            symlink_prefix_files(self.latest_model.stem, self.save_ckpt)
+            symlink_prefix_files(str(self.latest_model.with_suffix("")), self.save_ckpt)
             with open("checkpoint", "w") as f:
                 f.write(str(self.latest_model))
             if self.model_ema is not None:
-                self.latest_ema_model = Path(
-                    self.ema_save_ckpt + f"-{self.num_steps}.pt"
+                self.latest_ema_model = latest_checkpoint_path(
+                    self.ema_save_ckpt, self.num_steps, self.save_dir
                 )
                 self.save_ema_model(
                     self.latest_ema_model,
                     lr=cur_lr,
                     step=self.num_steps - 1,
                 )
-                symlink_prefix_files(self.latest_ema_model.stem, self.ema_save_ckpt)
+                symlink_prefix_files(
+                    str(self.latest_ema_model.with_suffix("")), self.ema_save_ckpt
+                )
 
         if self.num_steps == 0 and self.zero_stage > 0:
             # ZeRO-1 / FSDP: all ranks participate in save_model (collective op)
-            self.latest_model = Path(self.save_ckpt + "-0.pt")
+            self.latest_model = latest_checkpoint_path(self.save_ckpt, 0, self.save_dir)
             self.save_model(self.latest_model, lr=0, step=0)
             if self.model_ema is not None:
-                self.latest_ema_model = Path(self.ema_save_ckpt + "-0.pt")
+                self.latest_ema_model = latest_checkpoint_path(
+                    self.ema_save_ckpt, 0, self.save_dir
+                )
                 self.save_ema_model(self.latest_ema_model, lr=0, step=0)
 
         if (
@@ -1920,17 +2036,25 @@ class Trainer:
             if self.num_steps == 0:
                 if self.zero_stage == 0:
                     # When num_steps is 0, the checkpoint is never saved in the loop
-                    self.latest_model = Path(self.save_ckpt + "-0.pt")
+                    self.latest_model = latest_checkpoint_path(
+                        self.save_ckpt, 0, self.save_dir
+                    )
                     self.save_model(self.latest_model, lr=0, step=0)
                     if self.model_ema is not None:
-                        self.latest_ema_model = Path(self.ema_save_ckpt + "-0.pt")
+                        self.latest_ema_model = latest_checkpoint_path(
+                            self.ema_save_ckpt, 0, self.save_dir
+                        )
                         self.save_ema_model(self.latest_ema_model, lr=0, step=0)
                 log.info(f"Saved model to {self.latest_model}")
-                symlink_prefix_files(self.latest_model.stem, self.save_ckpt)
+                symlink_prefix_files(
+                    str(self.latest_model.with_suffix("")), self.save_ckpt
+                )
                 with open("checkpoint", "w") as f:
                     f.write(str(self.latest_model))
                 if self.model_ema is not None:
-                    symlink_prefix_files(self.latest_ema_model.stem, self.ema_save_ckpt)
+                    symlink_prefix_files(
+                        str(self.latest_ema_model.with_suffix("")), self.ema_save_ckpt
+                    )
 
             if self.timing_in_training and self.timed_steps:
                 msg = f"average training time: {self.total_train_time / self.timed_steps:.4f} s/batch"
@@ -2379,8 +2503,21 @@ def get_additional_data_requirement(_model: Any) -> list[DataRequirementItem]:
     if callable(has_spin):
         has_spin = has_spin()
     if has_spin:
+        # ``model.spin.allow_missing_label`` relaxes the spin label from mandatory to
+        # optional with a zero default, so a system without a ``spin`` file is filled
+        # with zeros rather than rejected. The flag is read from the model's spin
+        # configuration.
+        allow_missing_spin = getattr(
+            getattr(_model, "spin", None), "allow_missing_label", False
+        )
         spin_requirement_items = [
-            DataRequirementItem("spin", ndof=3, atomic=True, must=True)
+            DataRequirementItem(
+                "spin",
+                ndof=3,
+                atomic=True,
+                must=not allow_missing_spin,
+                default=0.0,
+            )
         ]
         additional_data_requirement += spin_requirement_items
     if _model.has_chg_spin_ebd():
@@ -2464,6 +2601,10 @@ def get_loss(
         loss_params["var_name"] = var_name
         loss_params["intensive"] = intensive
         return PropertyLoss(**loss_params)
+    elif loss_type == "population":
+        loss_params["starter_learning_rate"] = start_lr
+        return PopulationLoss(**loss_params)
+
     else:
         loss_params["starter_learning_rate"] = start_lr
         return TaskLoss.get_class_by_type(loss_type).get_loss(loss_params)
@@ -2535,24 +2676,13 @@ def model_change_out_bias(
     _sample_func: Callable[[], Any],
     _bias_adjust_mode: str = "change-by-statistic",
 ) -> Any:
-    old_bias = deepcopy(_model.get_out_bias())
-    _model.change_out_bias(
-        _sample_func,
-        bias_adjust_mode=_bias_adjust_mode,
-    )
-    new_bias = deepcopy(_model.get_out_bias())
-
     from deepmd.pt.model.model.dp_model import (
         DPModelCommon,
     )
 
-    if isinstance(_model, DPModelCommon) and _bias_adjust_mode == "set-by-statistic":
-        _model.get_fitting_net().compute_input_stats(_sample_func)
-
-    model_type_map = _model.get_type_map()
-    log.info(
-        f"Change output bias of {model_type_map!s} "
-        f"from {to_numpy_array(old_bias).reshape(-1)[: len(model_type_map)]!s} "
-        f"to {to_numpy_array(new_bias).reshape(-1)[: len(model_type_map)]!s}."
+    return change_model_out_bias(
+        _model,
+        _sample_func,
+        bias_adjust_mode=_bias_adjust_mode,
+        recompute_input_stats=isinstance(_model, DPModelCommon),
     )
-    return _model
