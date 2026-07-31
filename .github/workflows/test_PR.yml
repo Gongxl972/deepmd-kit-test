@@ -1,0 +1,155 @@
+name: Test PR
+
+on:
+  pull_request: # 4. PR 触发 -> 快速层
+
+# 3. 保持并发取消
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # ==================== 1. 编译构建阶段 (Build-Once) ====================
+  build-wheels:
+    name: Build Wheel (Py ${{ matrix.python }})
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # 2. ccache 编译缓存配置
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ccache-${{ runner.os }}-${{ matrix.python }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ matrix.python }}-
+
+      # 2. uv / pip 缓存
+      - name: Cache uv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('pyproject.toml', 'requirements*.txt') }}
+          restore-keys: uv-${{ runner.os }}-${{ matrix.python }}-
+
+      - run: python -m pip install -U uv build
+
+      # 执行 CMake/C++ 扩展编译并打包成 Wheel (24 个 shard 共享这 2 次编译产物)
+      - name: Build Wheel
+        run: |
+          export CCACHE_SLOPPINESS=time_macros,include_file_mtime
+          export CMAKE_C_COMPILER_LAUNCHER=ccache
+          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          python -m build --wheel --outdir dist/
+
+      - name: Upload Wheel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-py${{ matrix.python }}
+          path: dist/*.whl
+
+  # ==================== 2. 测试执行阶段 (24 Shards) ====================
+  testpython:
+    name: Test Python (Shard ${{ matrix.group }}, Py ${{ matrix.python }})
+    runs-on: ubuntu-22.04
+    needs: [build-wheels]
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        python: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # 6. 恢复 testmon 图谱缓存
+      - name: Restore Testmon Database
+        uses: actions/cache/restore@v4
+        id: testmon-cache
+        with:
+          path: .testmondata
+          key: testmon-${{ matrix.python }}-${{ github.sha }}
+          restore-keys: |
+            testmon-${{ matrix.python }}-${{ github.base_ref }}-
+            testmon-${{ matrix.python }}-master-
+
+      - name: Download Wheel Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-py${{ matrix.python }}
+          path: dist
+
+      - name: Fast Install Built Wheel
+        run: |
+          python -m pip install -U uv
+          # 直接安装预编译好的 wheel，秒级完成，零 C++ 编译开销！
+          uv pip install --system dist/*.whl[test,jax,torch] pytest-testmon array-api-strict pytest-split pytest-cov
+
+      - name: Determine Test Strategy
+        id: strategy
+        run: |
+          set -x
+          # 4. 分层逻辑控制
+          EVENT_NAME="${{ github.event_name }}"
+          
+          if [ "$EVENT_NAME" == "merge_group" ] || [ "${{ github.ref }}" == "refs/heads/master" ]; then
+            echo "::notice::Layer: Full Test (merge_group / master push)"
+            echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
+            echo "skip_all=false" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::Layer: PR Incremental Selective Test"
+            # 获取 Git 改动
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            git diff --name-only $BASE_SHA ${{ github.sha }} > /tmp/changed_files.txt
+            
+            CHANGED_FILES_PATH=/tmp/changed_files.txt python .github/scripts/detect_affected_tests.py > /tmp/detection.txt
+            cat /tmp/detection.txt >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Pytest
+        if: steps.strategy.outputs.skip_all != 'true'
+        run: |
+          SELECTED_PATHS="${{ steps.strategy.outputs.selected_paths }}"
+          echo "Executing tests on: $SELECTED_PATHS"
+          
+          # 使用 --testmon 建立/更新代码行维度的真实轨迹账本
+          pytest -vv $SELECTED_PATHS \
+            --testmon \
+            --cov=deepmd \
+            --splits 12 --group ${{ matrix.group }} \
+            --splitting-algorithm least_duration \
+            --disable-warnings || true
+
+      # 6. 保存/更新 testmon 依赖图谱缓存 (Push master 时更新基线)
+      - name: Save Testmon Database Cache
+        uses: actions/cache/save@v4
+        if: github.ref == 'refs/heads/master' && matrix.group == 1
+        with:
+          path: .testmondata
+          key: testmon-${{ matrix.python }}-${{ github.sha }}
+
+  # ==================== 3. 门禁通过校验 ====================
+  pass:
+    name: Pass testing Python
+    needs: [testpython]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: re-actors/alls-green@v1.2.2
+        with:
+          jobs: ${{ toJSON(needs) }}
