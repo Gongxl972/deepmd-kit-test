@@ -2645,4 +2645,3 @@ class GatedAttentionLayer(NativeOP):
         obj.in_proj = NativeLayer.deserialize(in_proj)
         obj.out_proj = NativeLayer.deserialize(out_proj)
         return obj
-#test
