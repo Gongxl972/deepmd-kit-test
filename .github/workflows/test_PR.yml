@@ -136,9 +136,9 @@ jobs:
           CPP_CHANGES=$(grep -E '\.(cc|h|cu|cpp)$|CMakeLists.txt|source/cmake/|source/include/|backend/|pyproject.toml' /tmp/changed_files.txt || true)
           if [ -n "$CPP_CHANGES" ]; then
             echo "::warning::C++ changes detected, will trigger C++ tests"
+            echo "trigger_cpp_tests=true" >> $GITHUB_OUTPUT
             echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
             echo "skip_all=false" >> $GITHUB_OUTPUT
-            echo "trigger_cpp_tests=true" >> $GITHUB_OUTPUT
             echo "test_change_risk=high" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -189,7 +189,7 @@ jobs:
           SELECTED_PATHS="${{ steps.strategy.outputs.selected_paths }}"
           echo "Executing tests on: $SELECTED_PATHS"
           
-          # 如果 SELECTED_PATHS 为空，则不运行测试
+          # 检查是否有测试路径需要运行
           if [ -z "$SELECTED_PATHS" ]; then
             echo "No tests to run."
             exit 0
