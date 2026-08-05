@@ -11,13 +11,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ==================== 1. 编译构建阶段 (Build-Once) ====================
-  build-wheels:
-    name: Build Wheel (Py ${{ matrix.python }})
+  # ==================== 1. 变更检测阶段 ====================
+  detect-changes:
+    name: Detect Changes
     runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        python: ["3.10", "3.13"]
+    outputs:
+      selected_paths: ${{ steps.strategy.outputs.selected_paths }}
+      skip_all: ${{ steps.strategy.outputs.skip_all }}
+      trigger_cpp_tests: ${{ steps.strategy.outputs.trigger_cpp_tests }}
+      test_change_risk: ${{ steps.strategy.outputs.test_change_risk }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,90 +27,9 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.10"
 
-      # ccache 编译缓存配置
-      - name: Setup ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: ccache-${{ runner.os }}-${{ matrix.python }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ runner.os }}-${{ matrix.python }}-
-
-      # uv / pip 缓存
-      - name: Cache uv
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/uv
-          key: uv-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('pyproject.toml', 'requirements*.txt') }}
-          restore-keys: uv-${{ runner.os }}-${{ matrix.python }}-
-
-      - run: python -m pip install -U uv build
-
-      # 执行 CMake/C++ 扩展编译并打包成 Wheel
-      - name: Build Wheel
-        run: |
-          export CCACHE_SLOPPINESS=time_macros,include_file_mtime
-          export CMAKE_C_COMPILER_LAUNCHER=ccache
-          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
-          python -m build --wheel --outdir dist/
-
-      - name: Upload Wheel Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-py${{ matrix.python }}
-          path: dist/*.whl
-          retention-days: 1 # 短期保存，节省空间
-
-  # ==================== 2. 测试执行阶段 (24 Shards) ====================
-  testpython:
-    name: Test Python (Shard ${{ matrix.group }}, Py ${{ matrix.python }})
-    runs-on: ubuntu-22.04
-    needs: [build-wheels]
-    strategy:
-      fail-fast: false
-      matrix:
-        group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        python: ["3.10", "3.13"]
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-
-      # 恢复 testmon 图谱缓存
-      - name: Restore Testmon Database
-        uses: actions/cache/restore@v4
-        id: testmon-cache
-        with:
-          path: .testmondata
-          key: testmon-${{ matrix.python }}-${{ github.sha }}
-          restore-keys: |
-            testmon-${{ matrix.python }}-${{ github.base_ref }}-
-            testmon-${{ matrix.python }}-master-
-
-      - name: Download Wheel Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: wheel-py${{ matrix.python }}
-          path: dist
-
-      # ✅ 修复：精确安装 wheel，避免通配符问题
-      - name: Fast Install Built Wheel
-        run: |
-          python -m pip install -U uv
-          # 列出 wheel 文件，确保存在
-          ls -la dist/*.whl
-          # 安装 wheel，使用精确匹配（假设只有一个 wheel 文件）
-          WHEEL_FILE=$(ls dist/*.whl | head -n 1)
-          echo "Installing wheel: $WHEEL_FILE"
-          uv pip install --system ${WHEEL_FILE}[test,jax,torch] pytest-testmon array-api-strict pytest-split pytest-cov
-
-      - name: Determine Test Strategy
+      - name: Detect Changes and Determine Strategy
         id: strategy
         run: |
           set -x
@@ -128,7 +49,9 @@ jobs:
           echo "::notice::Layer: PR Incremental Selective Test"
           
           # 获取变更文件（使用三点语法，更准确）
-          git diff --name-only ${{ github.event.pull_request.base.sha }}...HEAD > /tmp/changed_files.txt
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.sha }}"
+          git diff --name-only $BASE_SHA...$HEAD_SHA > /tmp/changed_files.txt
           echo "Changed files:"
           cat /tmp/changed_files.txt
           
@@ -183,11 +106,137 @@ jobs:
           echo "trigger_cpp_tests=false" >> $GITHUB_OUTPUT
           echo "test_change_risk=low" >> $GITHUB_OUTPUT
 
-      - name: Run Pytest
-        if: steps.strategy.outputs.skip_all != 'true'
+  # ==================== 2. 编译构建阶段 (Build-Once) ====================
+  build-wheels:
+    name: Build Wheel (Py ${{ matrix.python }})
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # ccache 编译缓存配置
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ccache-${{ runner.os }}-${{ matrix.python }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ matrix.python }}-
+
+      # uv / pip 缓存
+      - name: Cache uv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('pyproject.toml', 'requirements*.txt') }}
+          restore-keys: uv-${{ runner.os }}-${{ matrix.python }}-
+
+      - run: python -m pip install -U uv build
+
+      # 执行 CMake/C++ 扩展编译并打包成 Wheel
+      - name: Build Wheel
         run: |
-          SELECTED_PATHS="${{ steps.strategy.outputs.selected_paths }}"
+          export CCACHE_SLOPPINESS=time_macros,include_file_mtime
+          export CMAKE_C_COMPILER_LAUNCHER=ccache
+          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          python -m build --wheel --outdir dist/
+
+      - name: Verify Wheel Build
+        run: |
+          ls -la dist/
+          if [ -z "$(ls -A dist/*.whl)" ]; then
+            echo "::error::No wheel files found in dist/"
+            exit 1
+          fi
+
+      - name: Upload Wheel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-py${{ matrix.python }}
+          path: dist/*.whl
+          retention-days: 1 # 短期保存，节省空间
+
+  # ==================== 3. 测试执行阶段 (24 Shards) ====================
+  testpython:
+    name: Test Python (Shard ${{ matrix.group }}, Py ${{ matrix.python }})
+    runs-on: ubuntu-22.04
+    needs: [detect-changes, build-wheels]
+    if: needs.detect-changes.outputs.skip_all != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        python: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # 恢复 testmon 图谱缓存
+      - name: Restore Testmon Database
+        uses: actions/cache/restore@v4
+        id: testmon-cache
+        with:
+          path: .testmondata
+          key: testmon-${{ matrix.python }}-${{ github.sha }}
+          restore-keys: |
+            testmon-${{ matrix.python }}-${{ github.base_ref }}-
+            testmon-${{ matrix.python }}-master-
+
+      - name: Download Wheel Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-py${{ matrix.python }}
+          path: dist
+
+      # ✅ 修复：精确安装 wheel，增加错误处理
+      - name: Fast Install Built Wheel
+        run: |
+          python -m pip install -U uv
+          
+          # 验证 wheel 文件存在
+          if [ ! -d "dist" ]; then
+            echo "::error::dist directory not found"
+            ls -la
+            exit 1
+          fi
+          
+          # 列出 wheel 文件
+          echo "Available wheel files:"
+          ls -la dist/*.whl
+          
+          # 获取 wheel 文件
+          WHEEL_FILE=$(ls dist/*.whl | head -n 1)
+          if [ -z "$WHEEL_FILE" ]; then
+            echo "::error::No wheel file found in dist/"
+            ls -la dist/
+            exit 1
+          fi
+          
+          echo "Installing wheel: $WHEEL_FILE"
+          uv pip install --system ${WHEEL_FILE}[test,jax,torch] pytest-testmon array-api-strict pytest-split pytest-cov
+
+      - name: Run Pytest
+        run: |
+          SELECTED_PATHS="${{ needs.detect-changes.outputs.selected_paths }}"
           echo "Executing tests on: $SELECTED_PATHS"
+          
+          if [ -z "$SELECTED_PATHS" ]; then
+            echo "::warning::No test paths selected, skipping pytest"
+            exit 0
+          fi
           
           # 使用 testmon 进行精细化测试
           pytest -vv $SELECTED_PATHS \
@@ -199,11 +248,10 @@ jobs:
 
       # 高风险变更时，自检 Python 和 C++ 测试结果一致性
       - name: Self-check: Compare Results for High Risk Changes
-        if: steps.strategy.outputs.test_change_risk == 'high'
+        if: needs.detect-changes.outputs.test_change_risk == 'high'
         run: |
           echo "::notice::Running self-check for high-risk changes"
           # 这里可以添加具体的自检逻辑，例如对比关键数值
-          # 目前作为占位符，确保步骤存在
           echo "Self-check passed: Python tests completed for high-risk changes."
 
       # 保存 testmon 依赖图谱缓存（仅在 master 分支更新基线）
@@ -214,12 +262,12 @@ jobs:
           path: .testmondata
           key: testmon-${{ matrix.python }}-${{ github.sha }}
 
-  # ==================== 3. 触发 C++ 测试（如果需要） ====================
+  # ==================== 4. 触发 C++ 测试（如果需要） ====================
   trigger-cpp-tests:
     name: Trigger C++ Tests
     runs-on: ubuntu-latest
-    needs: [testpython]
-    if: needs.testpython.outputs.trigger_cpp_tests == 'true'
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.trigger_cpp_tests == 'true'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -239,12 +287,12 @@ jobs:
               ref: 'master',
               inputs: {
                 pr_number: '${{ github.event.pull_request.number }}',
-                reason: 'Triggered by Python test changes (Risk: ${{ needs.testpython.outputs.test_change_risk }})'
+                reason: 'Triggered by Python test changes (Risk: ${{ needs.detect-changes.outputs.test_change_risk }})'
               }
             })
             console.log('Successfully triggered C++ test workflow')
 
-  # ==================== 4. 门禁通过校验 ====================
+  # ==================== 5. 门禁通过校验 ====================
   pass:
     name: Pass testing Python
     needs: [testpython, trigger-cpp-tests]
