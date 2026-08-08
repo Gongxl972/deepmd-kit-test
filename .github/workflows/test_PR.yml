@@ -222,7 +222,7 @@ jobs:
             --disable-warnings
 
       # 高风险变更时，自检 Python 和 C++ 测试结果一致性
-      - name: Self-check: Compare Results for High Risk Changes
+      - name: Self-check Compare Results for High Risk Changes
         if: needs.detect-changes.outputs.test_change_risk == 'high'
         run: |
           echo "::notice::Running self-check for high-risk changes"
