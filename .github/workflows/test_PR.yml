@@ -219,7 +219,7 @@ jobs:
 
       # 高风险变更时，自检 Python 和 C++ 测试结果一致性
       # ✅ 修复：移除错误的 assert 1==2，改为检查测试执行状态
-      - name: Self-check: Compare Results for High Risk Changes
+      - name: Self-check- Compare Results for High Risk Changes
         if: needs.detect-changes.outputs.test_change_risk == 'high'
         run: |
           echo "::notice::Running self-check for high-risk changes"
