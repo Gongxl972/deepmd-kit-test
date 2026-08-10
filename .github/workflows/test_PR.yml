@@ -3,9 +3,8 @@ name: Test PR
 # 关键修改1：只在PR的特定事件时运行，排除PR内的push（synchronize事件）
 on:
   pull_request:
-    types: [opened, reopened, labeled, unlabeled, synchronize]
-    # 注意：synchronize事件就是PR内的push，保留它会响应push
-    # 如果你完全不想在PR内push时运行，删除synchronize即可
+    types: [opened, reopened, labeled, unlabeled]
+    # 注意：已移除 synchronize，PR内push将不会触发此工作流，符合你的需求
   merge_group:  # 合并队列 -> 全量门禁
   workflow_dispatch: # 手动触发，方便调试
 
@@ -15,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ==================== 1. 变更检测阶段 (单线程，避免矩阵输出混乱) ====================
+  # ==================== 1. 变更检测阶段 ====================
   detect-changes:
     name: Detect Changes
     runs-on: ubuntu-22.04
@@ -52,12 +51,12 @@ jobs:
           # PR 事件：增量测试逻辑
           echo "::notice::Layer: PR Incremental Selective Test"
           
-          # 获取变更文件（使用三点语法，更准确）
+          # 获取变更文件
           git diff --name-only ${{ github.event.pull_request.base.sha }}...HEAD > /tmp/changed_files.txt
           echo "Changed files:"
           cat /tmp/changed_files.txt
           
-          # 检查是否有 C++ 变更（需要触发 C++ 测试）
+          # 检查是否有 C++ 变更
           CPP_CHANGES=$(grep -E '\.(cc|h|cu|cpp)$|CMakeLists.txt|source/cmake/|source/include/|backend/|pyproject.toml' /tmp/changed_files.txt || true)
           if [ -n "$CPP_CHANGES" ]; then
             echo "::warning::C++ changes detected, will trigger C++ tests"
@@ -72,7 +71,6 @@ jobs:
           PYTEST_CHANGES=$(grep '^source/tests/.*\.py$' /tmp/changed_files.txt || true)
           if [ -n "$PYTEST_CHANGES" ]; then
             echo "Analyzing Python test changes..."
-            # 使用脚本分析测试变更风险等级
             python .github/scripts/analyze_test_changes.py /tmp/changed_files.txt > /tmp/test_risk.txt
             TEST_RISK=$(cat /tmp/test_risk.txt | grep 'test_change_risk=' | cut -d'=' -f2)
             echo "test_change_risk=$TEST_RISK" >> $GITHUB_OUTPUT
@@ -92,7 +90,6 @@ jobs:
                 ;;
               *)
                 echo "::notice::Low-risk test change detected"
-                # 低风险：使用 detect_affected_tests.py 做进一步筛选
                 CHANGED_FILES_PATH=/tmp/changed_files.txt python .github/scripts/detect_affected_tests.py > /tmp/detection.txt
                 cat /tmp/detection.txt >> $GITHUB_OUTPUT
                 echo "trigger_cpp_tests=false" >> $GITHUB_OUTPUT
@@ -101,14 +98,14 @@ jobs:
             exit 0
           fi
           
-          # 只有 Python 源码变更：使用 detect_affected_tests.py 做筛选
+          # 只有 Python 源码变更
           echo "Only Python source changes detected"
           CHANGED_FILES_PATH=/tmp/changed_files.txt python .github/scripts/detect_affected_tests.py > /tmp/detection.txt
           cat /tmp/detection.txt >> $GITHUB_OUTPUT
           echo "trigger_cpp_tests=false" >> $GITHUB_OUTPUT
           echo "test_change_risk=low" >> $GITHUB_OUTPUT
 
-  # ==================== 2. 编译构建阶段 (Build-Once) ====================
+  # ==================== 2. 编译构建阶段 ====================
   build-wheels:
     name: Build Wheel (Py ${{ matrix.python }})
     runs-on: ubuntu-22.04
@@ -124,7 +121,6 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # ccache 编译缓存配置
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
@@ -132,7 +128,6 @@ jobs:
           restore-keys: |
             ccache-${{ runner.os }}-${{ matrix.python }}-
 
-      # uv / pip 缓存
       - name: Cache uv
         uses: actions/cache@v4
         with:
@@ -142,7 +137,6 @@ jobs:
 
       - run: python -m pip install -U uv build
 
-      # 执行 CMake/C++ 扩展编译并打包成 Wheel
       - name: Build Wheel
         run: |
           export CCACHE_SLOPPINESS=time_macros,include_file_mtime
@@ -155,9 +149,9 @@ jobs:
         with:
           name: wheel-py${{ matrix.python }}
           path: dist/*.whl
-          retention-days: 1 # 短期保存，节省空间
+          retention-days: 1
 
-  # ==================== 3. 测试执行阶段 (24 Shards) ====================
+  # ==================== 3. 测试执行阶段 ====================
   testpython:
     name: Test Python (Shard ${{ matrix.group }}, Py ${{ matrix.python }})
     runs-on: ubuntu-22.04
@@ -178,7 +172,6 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # 恢复 testmon 图谱缓存（每个 shard 独立文件，避免污染）
       - name: Restore Testmon Database
         uses: actions/cache/restore@v4
         id: testmon-cache
@@ -195,50 +188,43 @@ jobs:
           name: wheel-py${{ matrix.python }}
           path: dist
 
-      # ✅ 修复：精确安装 wheel，避免通配符问题
       - name: Fast Install Built Wheel
         run: |
           python -m pip install -U uv
-          # 列出 wheel 文件，确保存在
           ls -la dist/*.whl
-          # 安装 wheel，使用精确匹配（假设只有一个 wheel 文件）
           WHEEL_FILE=$(ls dist/*.whl | head -n 1)
           echo "Installing wheel: $WHEEL_FILE"
           uv pip install --system ${WHEEL_FILE}[test,jax,torch] pytest-testmon array-api-strict pytest-split pytest-cov
 
       - name: Run Pytest
         run: |
-          SELECTED_PATHS="${{ needs.detect-changes.outputs.selected_paths }}"
+          # 关键修复：切换到 source 目录执行测试，解决 ModuleNotFoundError
+          cd source
+          SELECTED_PATHS="../${{ needs.detect-changes.outputs.selected_paths }}"
           echo "Executing tests on: $SELECTED_PATHS"
           
-          # 检查是否有测试路径需要运行
           if [ -z "$SELECTED_PATHS" ]; then
             echo "No tests to run."
             exit 0
           fi
           
-          # 设置独立的 testmon 数据文件
           export TESTMON_DATAFILE=.testmondata-${{ matrix.group }}
           
-          # 使用 testmon 进行精细化测试，同时忽略 test_force_fail.py
+          # 执行 pytest，路径基于 source 目录
           pytest -vv $SELECTED_PATHS \
             --testmon \
             --cov=deepmd \
             --splits 12 --group ${{ matrix.group }} \
             --splitting-algorithm least_duration \
             --disable-warnings \
-            --ignore=source/tests/test_force_fail.py
+            --ignore=tests/test_force_fail.py
 
-      # 高风险变更时，自检 Python 和 C++ 测试结果一致性
       - name: Self-check- Compare Results for High Risk Changes
         if: needs.detect-changes.outputs.test_change_risk == 'high'
         run: |
           echo "::notice::Running self-check for high-risk changes"
-          # 这里可以添加具体的自检逻辑，例如对比关键数值
-          # 目前作为占位符，确保步骤存在
           echo "Self-check passed: Python tests completed for high-risk changes."
 
-      # 保存 testmon 依赖图谱缓存（仅在 master 分支更新基线）
       - name: Save Testmon Database Cache
         uses: actions/cache/save@v4
         if: github.ref == 'refs/heads/master' && matrix.group == 1
@@ -246,7 +232,7 @@ jobs:
           path: .testmondata-${{ matrix.group }}
           key: testmon-${{ matrix.python }}-${{ github.sha }}-${{ matrix.group }}
 
-  # ==================== 4. 触发 C++ 测试（如果需要） ====================
+  # ==================== 4. 触发 C++ 测试 ====================
   trigger-cpp-tests:
     name: Trigger C++ Tests
     runs-on: ubuntu-latest
@@ -263,7 +249,6 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            // 触发原仓库的 test_cc.yml 工作流
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -286,5 +271,4 @@ jobs:
       - uses: re-actors/alls-green@v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          # 关键修复：允许 trigger-cpp-tests 和 pass 自身被跳过，不导致整体失败
           allowed-failures-regex: "trigger-cpp-tests|pass"
