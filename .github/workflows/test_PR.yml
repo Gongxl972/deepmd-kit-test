@@ -182,17 +182,49 @@ jobs:
           WHEEL_FILE=$(ls dist/*.whl | head -n 1)
           echo "Installing wheel: $WHEEL_FILE"
           uv pip install --system ${WHEEL_FILE}[test,jax,torch] pytest-testmon array-api-strict pytest-split pytest-cov
+          
+          # 关键修复：设置 PYTHONPATH 和 LD_LIBRARY_PATH
           echo "PYTHONPATH=$PWD:$PYTHONPATH" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          
+          # 验证安装
+          echo "=== Verifying installation ==="
+          python -c "import sys; print('Python executable:', sys.executable)"
+          python -c "import site; print('Site packages:', site.getsitepackages())"
 
-      # 👇👇👇 新增的调试步骤 👇👇👇
       - name: Debug Python Path and Package
         run: |
           echo "=== Debugging Python environment ==="
-          python -c "import sys; print('sys.path:', sys.path)"
+          echo "PYTHONPATH: $PYTHONPATH"
+          echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+          
+          echo "--- Python sys.path ---"
+          python -c "import sys; print('\n'.join(sys.path))"
+          
+          echo "--- Attempting to import deepmd ---"
           python -c "import deepmd; print('deepmd path:', deepmd.__file__)"
-          python -c "import deepmd.lib; print('deepmd.lib exists!')"
-          echo "=== Checking wheel contents ==="
-          unzip -l dist/*.whl | grep "deepmd/lib"
+          
+          echo "--- Checking deepmd directory contents ---"
+          python -c "import deepmd; import os; print(os.listdir(os.path.dirname(deepmd.__file__)))"
+          
+          echo "--- Looking for .so files ---"
+          find $PWD -name "*.so" | grep -E "deepmd|lib" | head -20
+          
+          echo "--- Checking wheel contents ---"
+          unzip -l dist/*.whl | grep -E "deepmd/.*\.so|deepmd/.*\.pyd" || echo "No .so files found in wheel"
+          
+          echo "--- Attempting to import deepmd.lib ---"
+          python -c "import deepmd.lib; print('deepmd.lib imported successfully')" || echo "Failed to import deepmd.lib"
+          
+          echo "--- Checking library dependencies ---"
+          # 如果找到了 .so 文件，检查其依赖
+          SO_FILE=$(find $PWD -name "*.so" | grep -E "deepmd.*lib|libdeepmd" | head -1)
+          if [ -n "$SO_FILE" ]; then
+            echo "Found .so file: $SO_FILE"
+            ldd $SO_FILE || echo "ldd failed"
+          else
+            echo "No .so file found"
+          fi
 
       - name: Run Pytest
         run: |
@@ -205,6 +237,10 @@ jobs:
           fi
           
           export TESTMON_DATAFILE=.testmondata-${{ matrix.group }}
+          
+          # 确保环境变量生效
+          export PYTHONPATH=$PWD:$PYTHONPATH
+          export LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH
           
           pytest -vv $SELECTED_PATHS \
             --testmon \
