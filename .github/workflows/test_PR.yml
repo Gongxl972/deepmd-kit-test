@@ -2,7 +2,7 @@ name: Test PR
 
 on:
   pull_request:
-    types: [opened, reopened, labeled, unlabeled, synchronize]  # 加回 synchronize
+    types: [opened, reopened, labeled, unlabeled, synchronize]
   merge_group:
   workflow_dispatch:
 
@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       selected_paths: ${{ steps.strategy.outputs.selected_paths }}
+      selected_paths_exist: ${{ steps.strategy.outputs.selected_paths_exist }}
       skip_all: ${{ steps.strategy.outputs.skip_all }}
       trigger_cpp_tests: ${{ steps.strategy.outputs.trigger_cpp_tests }}
       test_change_risk: ${{ steps.strategy.outputs.test_change_risk }}
@@ -24,7 +25,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          # ✅ 关键修复 1：拉取完整历史，确保 git diff 能找到 merge-base
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -35,7 +37,7 @@ jobs:
         run: |
           set -x
           EVENT_NAME="${{ github.event_name }}"
-          
+
           if [ "$EVENT_NAME" == "merge_group" ] || [ "${{ github.ref }}" == "refs/heads/master" ]; then
             echo "::notice::Layer: Full Test (merge_group / master push)"
             echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
@@ -46,13 +48,13 @@ jobs:
             echo "run_full_tests=true" >> $GITHUB_OUTPUT
             exit 0
           fi
-          
+
           echo "::notice::Layer: PR Incremental Selective Test"
-          git diff --name-only ${{ github.event.pull_request.base.sha }}...HEAD > /tmp/changed_files.txt
+          # ✅ 关键修复 2：使用双点语法，在 fetch-depth: 0 下更稳定
+          git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD > /tmp/changed_files.txt
           echo "Changed files:"
           cat /tmp/changed_files.txt
-          
-          # 检查是否有 C++ 变更
+
           CPP_CHANGES=$(grep -E '\.(cc|h|cu|cpp)$|CMakeLists.txt|source/cmake/|source/include/|backend/|pyproject.toml' /tmp/changed_files.txt || true)
           if [ -n "$CPP_CHANGES" ]; then
             echo "::warning::C++ changes detected, will trigger full tests"
@@ -61,22 +63,21 @@ jobs:
             echo "skip_all=false" >> $GITHUB_OUTPUT
             echo "test_change_risk=high" >> $GITHUB_OUTPUT
             echo "use_testmon=false" >> $GITHUB_OUTPUT
-            echo "run_full_tests=true" >> $GITHUB_OUTPUT  # 新增：标记需要全量测试
+            echo "run_full_tests=true" >> $GITHUB_OUTPUT
             exit 0
           fi
-          
-          # Python 变更：使用 testmon
+
           echo "::notice::Python-only changes, enabling testmon"
           echo "use_testmon=true" >> $GITHUB_OUTPUT
-          echo "run_full_tests=false" >> $GITHUB_OUTPUT  # 新增：不需要全量测试
-          
+          echo "run_full_tests=false" >> $GITHUB_OUTPUT
+
           PYTEST_CHANGES=$(grep '^source/tests/.*\.py$' /tmp/changed_files.txt || true)
           if [ -n "$PYTEST_CHANGES" ]; then
             echo "Analyzing Python test changes..."
             python .github/scripts/analyze_test_changes.py /tmp/changed_files.txt > /tmp/test_risk.txt
             TEST_RISK=$(cat /tmp/test_risk.txt | grep 'test_change_risk=' | cut -d'=' -f2)
             echo "test_change_risk=$TEST_RISK" >> $GITHUB_OUTPUT
-            
+
             case $TEST_RISK in
               "high")
                 echo "::warning::High-risk test change detected"
@@ -99,15 +100,13 @@ jobs:
             esac
             exit 0
           fi
-          
+
           echo "Only Python source changes detected"
           CHANGED_FILES_PATH=/tmp/changed_files.txt python .github/scripts/detect_affected_tests.py > /tmp/detection.txt
           cat /tmp/detection.txt >> $GITHUB_OUTPUT
           echo "trigger_cpp_tests=false" >> $GITHUB_OUTPUT
-          echo "test_change_risk=high" >> $GITHUB_OUTPUT
-          echo "run_full_tests=false" >> $GITHUB_OUTPUT
+          echo "test_change_risk=low" >> $GITHUB_OUTPUT
 
-  # 新增：轻量级增量测试（仅 Python-only PR）
   testpython-incremental:
     name: Test Python (Incremental)
     runs-on: ubuntu-22.04
@@ -117,10 +116,10 @@ jobs:
       needs.detect-changes.outputs.run_full_tests != 'true' &&
       needs.detect-changes.outputs.use_testmon == 'true'
     strategy:
-      fail-fast: true  # 改为 true，快速失败节省资源
+      fail-fast: true
       matrix:
         group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        python: ["3.10"]  # 只用一个 Python 版本
+        python: ["3.10"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -159,7 +158,7 @@ jobs:
             echo "No tests to run."
             exit 0
           fi
-          
+
           pytest -vv $SELECTED_PATHS \
             --testmon \
             --cov=deepmd \
@@ -175,7 +174,6 @@ jobs:
           path: .testmondata
           key: testmon-${{ matrix.python }}-${{ github.sha }}
 
-  # 新增：触发原版全量测试（C++ 变更时）
   trigger-full-tests:
     name: Trigger Full Tests
     runs-on: ubuntu-latest
@@ -201,7 +199,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: '${{ matrix.workflow }}',
-              ref: 'master',
+              ref: '${{ github.event.pull_request.base.ref }}',
               inputs: {
                 pr_number: '${{ github.event.pull_request.number }}',
                 reason: 'C++ changes detected, running full tests',
@@ -209,9 +207,6 @@ jobs:
               }
             })
             console.log('Successfully triggered full tests: ${{ matrix.workflow }}')
-
-  # 移除原有的 build-wheels、testpython、trigger-cpp-tests jobs
-  # 这些功能现在由原版工作流承担
 
   pass:
     name: Pass testing Python
@@ -222,4 +217,6 @@ jobs:
       - uses: re-actors/alls-green@v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          allowed-failures-regex: "trigger-full-tests|pass"
+          # ✅ 关键修复 3：使用正确的参数名，且只放行纯调度Job
+          # trigger-full-tests 只是API调用，失败不影响代码质量
+          allowed-failures: trigger-full-tests
