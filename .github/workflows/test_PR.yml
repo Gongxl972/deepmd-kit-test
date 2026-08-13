@@ -198,7 +198,7 @@ jobs:
           uv pip install --system ${WHEEL_FILE}[test,jax,torch] pytest-testmon array-api-strict pytest-split pytest-cov
           
           # 设置环境变量
-          echo "PYTHONPATH=$PWD:$PYTHONPATH" >> $GITHUB_ENV
+          #echo "PYTHONPATH=$PWD:$PYTHONPATH" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       # 关键优化5：缓存pytest-split的测试时长数据（加速分片+分片更均匀）
