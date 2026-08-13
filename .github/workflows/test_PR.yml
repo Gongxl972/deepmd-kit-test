@@ -16,7 +16,6 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       selected_paths: ${{ steps.strategy.outputs.selected_paths }}
-      selected_paths_exist: ${{ steps.strategy.outputs.selected_paths_exist }}
       skip_all: ${{ steps.strategy.outputs.skip_all }}
       trigger_cpp_tests: ${{ steps.strategy.outputs.trigger_cpp_tests }}
       test_change_risk: ${{ steps.strategy.outputs.test_change_risk }}
@@ -25,8 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # ✅ 关键修复 1：拉取完整历史，确保 git diff 能找到 merge-base
-          fetch-depth: 0
+          fetch-depth: 0  # 关键：拉取完整历史，解决 git diff 报错
 
       - uses: actions/setup-python@v5
         with:
@@ -50,7 +48,6 @@ jobs:
           fi
 
           echo "::notice::Layer: PR Incremental Selective Test"
-          # ✅ 关键修复 2：使用双点语法，在 fetch-depth: 0 下更稳定
           git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD > /tmp/changed_files.txt
           echo "Changed files:"
           cat /tmp/changed_files.txt
@@ -148,7 +145,14 @@ jobs:
 
       - name: Install with testmon
         run: |
-          uv pip install --system -e .[test,jax,torch] --group pin_tensorflow_cpu --group pin_pytorch_cpu --torch-backend cpu
+          # 关键修复：移除 [jax,torch] extras，避免 torch 版本冲突
+          # 使用 --prerelease=allow 允许安装 deepmd-kit 开发版
+          # 仅安装核心测试依赖和 CPU 版本的 torch/tensorflow
+          uv pip install --system -e . \
+            --group pin_tensorflow_cpu \
+            --group pin_pytorch_cpu \
+            --torch-backend cpu \
+            --prerelease=allow
           echo "LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       - name: Run Incremental Pytest
@@ -217,6 +221,5 @@ jobs:
       - uses: re-actors/alls-green@v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          # ✅ 关键修复 3：使用正确的参数名，且只放行纯调度Job
-          # trigger-full-tests 只是API调用，失败不影响代码质量
+          # 仅允许纯调度 Job 失败，不影响代码质量门禁
           allowed-failures: trigger-full-tests
