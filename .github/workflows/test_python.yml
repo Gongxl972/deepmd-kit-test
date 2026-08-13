@@ -6,6 +6,21 @@ on:
       - "dependabot/**"
       - "pre-commit-ci-update-config"
   merge_group:
+  workflow_dispatch:  # 支持被 test_PR.yml 调用
+    inputs:
+      pr_number:
+        description: 'PR number to test'
+        required: false
+        type: string
+      reason:
+        description: 'Reason for triggering'
+        required: false
+        type: string
+      run_mode:
+        description: 'Test mode: incremental or full'
+        required: false
+        type: string
+        default: 'full'
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
   cancel-in-progress: true
