@@ -2,7 +2,7 @@ name: Test PR
 
 on:
   pull_request:
-    types: [opened, reopened, labeled, unlabeled]
+    types: [opened, reopened, labeled, unlabeled, synchronize]  # 加回 synchronize
   merge_group:
   workflow_dispatch:
 
@@ -20,10 +20,11 @@ jobs:
       trigger_cpp_tests: ${{ steps.strategy.outputs.trigger_cpp_tests }}
       test_change_risk: ${{ steps.strategy.outputs.test_change_risk }}
       use_testmon: ${{ steps.strategy.outputs.use_testmon }}
+      run_full_tests: ${{ steps.strategy.outputs.run_full_tests }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1  # 关键优化1：只拉取最新提交，加速checkout
+          fetch-depth: 1
 
       - uses: actions/setup-python@v5
         with:
@@ -41,7 +42,8 @@ jobs:
             echo "skip_all=false" >> $GITHUB_OUTPUT
             echo "trigger_cpp_tests=true" >> $GITHUB_OUTPUT
             echo "test_change_risk=high" >> $GITHUB_OUTPUT
-            echo "use_testmon=false" >> $GITHUB_OUTPUT  # 全量测试不用testmon
+            echo "use_testmon=false" >> $GITHUB_OUTPUT
+            echo "run_full_tests=true" >> $GITHUB_OUTPUT
             exit 0
           fi
           
@@ -53,18 +55,20 @@ jobs:
           # 检查是否有 C++ 变更
           CPP_CHANGES=$(grep -E '\.(cc|h|cu|cpp)$|CMakeLists.txt|source/cmake/|source/include/|backend/|pyproject.toml' /tmp/changed_files.txt || true)
           if [ -n "$CPP_CHANGES" ]; then
-            echo "::warning::C++ changes detected, will trigger C++ tests"
+            echo "::warning::C++ changes detected, will trigger full tests"
             echo "trigger_cpp_tests=true" >> $GITHUB_OUTPUT
             echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
             echo "skip_all=false" >> $GITHUB_OUTPUT
             echo "test_change_risk=high" >> $GITHUB_OUTPUT
-            echo "use_testmon=false" >> $GITHUB_OUTPUT  # C++变更不用testmon（会失效）
+            echo "use_testmon=false" >> $GITHUB_OUTPUT
+            echo "run_full_tests=true" >> $GITHUB_OUTPUT  # 新增：标记需要全量测试
             exit 0
           fi
           
           # Python 变更：使用 testmon
           echo "::notice::Python-only changes, enabling testmon"
           echo "use_testmon=true" >> $GITHUB_OUTPUT
+          echo "run_full_tests=false" >> $GITHUB_OUTPUT  # 新增：不需要全量测试
           
           PYTEST_CHANGES=$(grep '^source/tests/.*\.py$' /tmp/changed_files.txt || true)
           if [ -n "$PYTEST_CHANGES" ]; then
@@ -100,79 +104,34 @@ jobs:
           CHANGED_FILES_PATH=/tmp/changed_files.txt python .github/scripts/detect_affected_tests.py > /tmp/detection.txt
           cat /tmp/detection.txt >> $GITHUB_OUTPUT
           echo "trigger_cpp_tests=false" >> $GITHUB_OUTPUT
-          echo "test_change_risk=low" >> $GITHUB_OUTPUT
+          echo "test_change_risk=high" >> $GITHUB_OUTPUT
+          echo "run_full_tests=false" >> $GITHUB_OUTPUT
 
-  build-wheels:
-    name: Build Wheel (Py ${{ matrix.python }})
+  # 新增：轻量级增量测试（仅 Python-only PR）
+  testpython-incremental:
+    name: Test Python (Incremental)
     runs-on: ubuntu-22.04
+    needs: [detect-changes]
+    if: |
+      needs.detect-changes.outputs.skip_all != 'true' &&
+      needs.detect-changes.outputs.run_full_tests != 'true' &&
+      needs.detect-changes.outputs.use_testmon == 'true'
     strategy:
-      matrix:
-        python: ["3.10", "3.13"]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1  # 关键优化1：只拉取最新提交
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-
-      - name: Setup ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: ccache-${{ runner.os }}-${{ matrix.python }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ runner.os }}-${{ matrix.python }}-
-
-      - name: Cache uv
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/uv
-          key: uv-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('pyproject.toml', 'requirements*.txt') }}
-          restore-keys: uv-${{ runner.os }}-${{ matrix.python }}-
-
-      - run: python -m pip install -U uv build
-
-      - name: Build Wheel
-        run: |
-          export CCACHE_SLOPPINESS=time_macros,include_file_mtime
-          export CMAKE_C_COMPILER_LAUNCHER=ccache
-          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
-          python -m build --wheel --outdir dist/
-
-      # 关键优化3：用Cache代替Artifact传Wheel（速度快30%）
-      - name: Cache Wheel
-        uses: actions/cache@v4
-        with:
-          path: dist/*.whl
-          key: wheel-${{ runner.os }}-${{ matrix.python }}-${{ github.sha }}
-          restore-keys: |
-            wheel-${{ runner.os }}-${{ matrix.python }}-
-
-  testpython:
-    name: Test Python (Shard ${{ matrix.group }}, Py ${{ matrix.python }})
-    runs-on: ubuntu-22.04
-    needs: [build-wheels, detect-changes]
-    if: needs.detect-changes.outputs.skip_all != 'true'
-    strategy:
-      fail-fast: false
+      fail-fast: true  # 改为 true，快速失败节省资源
       matrix:
         group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        python: ["3.10", "3.13"]
-
+        python: ["3.10"]  # 只用一个 Python 版本
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1  # 关键优化1：只拉取最新提交
+          fetch-depth: 1
 
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
 
-      # 关键优化4：恢复全局testmon缓存（不再是每个shard独立）
       - name: Restore Testmon Database
         uses: actions/cache/restore@v4
-        id: testmon-cache
         with:
           path: .testmondata
           key: testmon-${{ matrix.python }}-${{ github.sha }}
@@ -180,90 +139,35 @@ jobs:
             testmon-${{ matrix.python }}-${{ github.base_ref }}-
             testmon-${{ matrix.python }}-master-
 
-      # 关键优化3：恢复Wheel缓存（代替Artifact下载）
-      - name: Restore Wheel Cache
-        uses: actions/cache/restore@v4
-        with:
-          path: dist/*.whl
-          key: wheel-${{ runner.os }}-${{ matrix.python }}-${{ github.sha }}
-          restore-keys: |
-            wheel-${{ runner.os }}-${{ matrix.python }}-
-
-      - name: Fast Install Built Wheel
-        run: |
-          python -m pip install -U uv
-          ls -la dist/*.whl
-          WHEEL_FILE=$(ls dist/*.whl | head -n 1)
-          echo "Installing wheel: $WHEEL_FILE"
-          uv pip install --system ${WHEEL_FILE}[test,jax,torch] pytest-testmon array-api-strict pytest-split pytest-cov
-          
-          # 设置环境变量
-          #echo "PYTHONPATH=$PWD:$PYTHONPATH" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH" >> $GITHUB_ENV
-
-      # 关键优化5：缓存pytest-split的测试时长数据（加速分片+分片更均匀）
-      - name: Cache pytest durations
+      - name: Cache uv
         uses: actions/cache@v4
         with:
-          path: .pytest-split-durations
-          key: pytest-durations-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('source/tests/**/*.py') }}
-          restore-keys: |
-            pytest-durations-${{ runner.os }}-${{ matrix.python }}-
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('pyproject.toml', 'requirements*.txt') }}
 
-      # 仅手动触发时运行调试步骤（避免正式环境浪费时间）
-      - name: Debug Python Path and Package (Manual Only)
-        if: github.event_name == 'workflow_dispatch'
+      - run: python -m pip install -U uv pytest-testmon array-api-strict pytest-split pytest-cov
+
+      - name: Install with testmon
         run: |
-          echo "=== Debugging Python environment ==="
-          echo "PYTHONPATH: $PYTHONPATH"
-          echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
-          python -c "import sys; print('sys.path:', sys.path)"
-          python -c "import deepmd; print('deepmd path:', deepmd.__file__)"
-          python -c "import deepmd.lib; print('deepmd.lib imported successfully')" || echo "Failed to import deepmd.lib"
-          find $PWD -name "*.so" | grep -E "deepmd|lib" | head -5
+          uv pip install --system -e .[test,jax,torch] --group pin_tensorflow_cpu --group pin_pytorch_cpu --torch-backend cpu
+          echo "LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
-      - name: Run Pytest
+      - name: Run Incremental Pytest
         run: |
           SELECTED_PATHS="${{ needs.detect-changes.outputs.selected_paths }}"
-          echo "Executing tests on: $SELECTED_PATHS"
-          
           if [ -z "$SELECTED_PATHS" ]; then
             echo "No tests to run."
             exit 0
           fi
           
-          # 统计测试数量（用于监控testmon效果）
-          TOTAL_TESTS=$(pytest --collect-only $SELECTED_PATHS -q 2>/dev/null | tail -1 | awk '{print $1}' || echo "unknown")
-          echo "::notice::Total tests to run: $TOTAL_TESTS"
-          
-          # 动态决定是否使用testmon
-          USE_TESTMON="${{ needs.detect-changes.outputs.use_testmon }}"
-          if [ "$USE_TESTMON" == "true" ]; then
-            echo "::notice::Using testmon for incremental testing"
-            TESTMON_ARG="--testmon"
-          else
-            echo "::notice::Skipping testmon (C++ changes or full test)"
-            TESTMON_ARG=""
-          fi
-          
-          export PYTHONPATH=$PWD:$PYTHONPATH
-          export LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH
-          
           pytest -vv $SELECTED_PATHS \
-            $TESTMON_ARG \
+            --testmon \
             --cov=deepmd \
             --splits 12 --group ${{ matrix.group }} \
             --splitting-algorithm least_duration \
             --disable-warnings \
             --ignore=source/tests/test_force_fail.py
 
-      - name: Self-check- Compare Results for High Risk Changes
-        if: needs.detect-changes.outputs.test_change_risk == 'high'
-        run: |
-          echo "::notice::Running self-check for high-risk changes"
-          echo "Self-check passed: Python tests completed for high-risk changes."
-
-      # 关键优化4：保存全局testmon缓存（仅master分支）
       - name: Save Testmon Database Cache
         uses: actions/cache/save@v4
         if: github.ref == 'refs/heads/master' && matrix.group == 1
@@ -271,23 +175,24 @@ jobs:
           path: .testmondata
           key: testmon-${{ matrix.python }}-${{ github.sha }}
 
-  trigger-cpp-tests:
-    name: Trigger C++ Tests
+  # 新增：触发原版全量测试（C++ 变更时）
+  trigger-full-tests:
+    name: Trigger Full Tests
     runs-on: ubuntu-latest
     needs: [detect-changes]
-    # 关键修改：添加条件判断，避免在 PR 事件中重复触发
-    # 只在非 PR 事件（merge_group、workflow_dispatch、push to master）时触发
-    # 或者在 PR 事件中，但 test_cc.yml 没有配置 pull_request 触发器时触发
     if: |
-      needs.detect-changes.outputs.trigger_cpp_tests == 'true' &&
-      github.event_name != 'pull_request'
+      needs.detect-changes.outputs.run_full_tests == 'true' &&
+      github.event_name == 'pull_request'
+    strategy:
+      matrix:
+        workflow: [test_python.yml, test_cc.yml]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Trigger C++ Test Workflow
+      - name: Trigger Full Test Workflow
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -295,22 +200,26 @@ jobs:
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              workflow_id: 'test_cc.yml',
+              workflow_id: '${{ matrix.workflow }}',
               ref: 'master',
               inputs: {
                 pr_number: '${{ github.event.pull_request.number }}',
-                reason: 'Triggered by Python test changes (Risk: ${{ needs.detect-changes.outputs.test_change_risk }})'
+                reason: 'C++ changes detected, running full tests',
+                run_mode: 'full'
               }
             })
-            console.log('Successfully triggered C++ test workflow')
+            console.log('Successfully triggered full tests: ${{ matrix.workflow }}')
+
+  # 移除原有的 build-wheels、testpython、trigger-cpp-tests jobs
+  # 这些功能现在由原版工作流承担
 
   pass:
     name: Pass testing Python
     runs-on: ubuntu-latest
-    needs: [testpython, trigger-cpp-tests]
+    needs: [detect-changes, testpython-incremental, trigger-full-tests]
     if: always()
     steps:
       - uses: re-actors/alls-green@v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          allowed-failures-regex: "trigger-cpp-tests|pass"
+          allowed-failures-regex: "trigger-full-tests|pass"
