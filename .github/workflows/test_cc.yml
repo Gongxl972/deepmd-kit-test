@@ -17,7 +17,7 @@ name: Test C++
 jobs:
   # ==================== 非内存泄漏检测（并行分片） ====================
   testcc:
-    name: Test C++ (Shard ${{ matrix.group }}, TF: ${{ matrix.enable_tensorflow }}, Torch: ${{ matrix.enable_pytorch }}, Paddle: ${{ matrix.enable_paddle }})
+    name: "Test C++ (Shard ${{ matrix.group }}, TF: ${{ matrix.enable_tensorflow }}, Torch: ${{ matrix.enable_pytorch }}, Paddle: ${{ matrix.enable_paddle }})"
     runs-on: ${{ github.repository_owner == 'deepmodeling' && 'cpu' || 'ubuntu-22.04' }}
     timeout-minutes: 45
     strategy:
@@ -141,11 +141,11 @@ jobs:
           ENABLE_JAX: ${{ matrix.enable_tensorflow && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && '1' || '0' }}
 
-      # ✅ 合并耗时文件
+      # ✅ 合并耗时文件（已修复 jq 语法问题）
       - name: Combine durations
         run: |
           if [ -f .test_durations_lmp ] && [ -f .test_durations_ipi ]; then
-            jq -s 'reduce .[] as $d ($durations_lmp; . * $durations_ipi)' .test_durations_lmp .test_durations_ipi > .test_durations_${{ matrix.group }}
+            jq -s 'reduce .[] as $durations ({}; . * $durations)' .test_durations_lmp .test_durations_ipi > .test_durations_${{ matrix.group }}
           elif [ -f .test_durations_lmp ]; then
             cp .test_durations_lmp .test_durations_${{ matrix.group }}
           else
@@ -169,7 +169,7 @@ jobs:
 
   # ==================== 内存泄漏检测（完全串行） ====================
   testcc-memleak:
-    name: Test C++ (Memleak, TF: ${{ matrix.enable_tensorflow }}, Torch: ${{ matrix.enable_pytorch }}, Paddle: ${{ matrix.enable_paddle }})
+    name: "Test C++ (Memleak, TF: ${{ matrix.enable_tensorflow }}, Torch: ${{ matrix.enable_pytorch }}, Paddle: ${{ matrix.enable_paddle }})"
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     strategy:
