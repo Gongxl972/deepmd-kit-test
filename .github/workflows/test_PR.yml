@@ -275,7 +275,12 @@ jobs:
     name: Trigger C++ Tests
     runs-on: ubuntu-latest
     needs: [detect-changes]
-    if: needs.detect-changes.outputs.trigger_cpp_tests == 'true'
+    # 关键修改：添加条件判断，避免在 PR 事件中重复触发
+    # 只在非 PR 事件（merge_group、workflow_dispatch、push to master）时触发
+    # 或者在 PR 事件中，但 test_cc.yml 没有配置 pull_request 触发器时触发
+    if: |
+      needs.detect-changes.outputs.trigger_cpp_tests == 'true' &&
+      github.event_name != 'pull_request'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
