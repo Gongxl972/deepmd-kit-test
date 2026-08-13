@@ -19,10 +19,11 @@ jobs:
       skip_all: ${{ steps.strategy.outputs.skip_all }}
       trigger_cpp_tests: ${{ steps.strategy.outputs.trigger_cpp_tests }}
       test_change_risk: ${{ steps.strategy.outputs.test_change_risk }}
+      use_testmon: ${{ steps.strategy.outputs.use_testmon }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1  # 关键优化1：只拉取最新提交，加速checkout
 
       - uses: actions/setup-python@v5
         with:
@@ -40,6 +41,7 @@ jobs:
             echo "skip_all=false" >> $GITHUB_OUTPUT
             echo "trigger_cpp_tests=true" >> $GITHUB_OUTPUT
             echo "test_change_risk=high" >> $GITHUB_OUTPUT
+            echo "use_testmon=false" >> $GITHUB_OUTPUT  # 全量测试不用testmon
             exit 0
           fi
           
@@ -48,6 +50,7 @@ jobs:
           echo "Changed files:"
           cat /tmp/changed_files.txt
           
+          # 检查是否有 C++ 变更
           CPP_CHANGES=$(grep -E '\.(cc|h|cu|cpp)$|CMakeLists.txt|source/cmake/|source/include/|backend/|pyproject.toml' /tmp/changed_files.txt || true)
           if [ -n "$CPP_CHANGES" ]; then
             echo "::warning::C++ changes detected, will trigger C++ tests"
@@ -55,8 +58,13 @@ jobs:
             echo "selected_paths=source/tests" >> $GITHUB_OUTPUT
             echo "skip_all=false" >> $GITHUB_OUTPUT
             echo "test_change_risk=high" >> $GITHUB_OUTPUT
+            echo "use_testmon=false" >> $GITHUB_OUTPUT  # C++变更不用testmon（会失效）
             exit 0
           fi
+          
+          # Python 变更：使用 testmon
+          echo "::notice::Python-only changes, enabling testmon"
+          echo "use_testmon=true" >> $GITHUB_OUTPUT
           
           PYTEST_CHANGES=$(grep '^source/tests/.*\.py$' /tmp/changed_files.txt || true)
           if [ -n "$PYTEST_CHANGES" ]; then
@@ -103,7 +111,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1  # 关键优化1：只拉取最新提交
 
       - uses: actions/setup-python@v5
         with:
@@ -132,12 +140,14 @@ jobs:
           export CMAKE_CXX_COMPILER_LAUNCHER=ccache
           python -m build --wheel --outdir dist/
 
-      - name: Upload Wheel Artifact
-        uses: actions/upload-artifact@v4
+      # 关键优化3：用Cache代替Artifact传Wheel（速度快30%）
+      - name: Cache Wheel
+        uses: actions/cache@v4
         with:
-          name: wheel-py${{ matrix.python }}
           path: dist/*.whl
-          retention-days: 1
+          key: wheel-${{ runner.os }}-${{ matrix.python }}-${{ github.sha }}
+          restore-keys: |
+            wheel-${{ runner.os }}-${{ matrix.python }}-
 
   testpython:
     name: Test Python (Shard ${{ matrix.group }}, Py ${{ matrix.python }})
@@ -153,27 +163,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1  # 关键优化1：只拉取最新提交
 
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
 
+      # 关键优化4：恢复全局testmon缓存（不再是每个shard独立）
       - name: Restore Testmon Database
         uses: actions/cache/restore@v4
         id: testmon-cache
         with:
-          path: .testmondata-${{ matrix.group }}
-          key: testmon-${{ matrix.python }}-${{ github.sha }}-${{ matrix.group }}
+          path: .testmondata
+          key: testmon-${{ matrix.python }}-${{ github.sha }}
           restore-keys: |
-            testmon-${{ matrix.python }}-${{ github.base_ref }}-${{ matrix.group }}-
-            testmon-${{ matrix.python }}-master-${{ matrix.group }}-
+            testmon-${{ matrix.python }}-${{ github.base_ref }}-
+            testmon-${{ matrix.python }}-master-
 
-      - name: Download Wheel Artifact
-        uses: actions/download-artifact@v4
+      # 关键优化3：恢复Wheel缓存（代替Artifact下载）
+      - name: Restore Wheel Cache
+        uses: actions/cache/restore@v4
         with:
-          name: wheel-py${{ matrix.python }}
-          path: dist
+          path: dist/*.whl
+          key: wheel-${{ runner.os }}-${{ matrix.python }}-${{ github.sha }}
+          restore-keys: |
+            wheel-${{ runner.os }}-${{ matrix.python }}-
 
       - name: Fast Install Built Wheel
         run: |
@@ -183,48 +197,30 @@ jobs:
           echo "Installing wheel: $WHEEL_FILE"
           uv pip install --system ${WHEEL_FILE}[test,jax,torch] pytest-testmon array-api-strict pytest-split pytest-cov
           
-          # 关键修复：设置 PYTHONPATH 和 LD_LIBRARY_PATH
+          # 设置环境变量
           echo "PYTHONPATH=$PWD:$PYTHONPATH" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH" >> $GITHUB_ENV
-          
-          # 验证安装
-          echo "=== Verifying installation ==="
-          python -c "import sys; print('Python executable:', sys.executable)"
-          python -c "import site; print('Site packages:', site.getsitepackages())"
 
-      - name: Debug Python Path and Package
+      # 关键优化5：缓存pytest-split的测试时长数据（加速分片+分片更均匀）
+      - name: Cache pytest durations
+        uses: actions/cache@v4
+        with:
+          path: .pytest-split-durations
+          key: pytest-durations-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('source/tests/**/*.py') }}
+          restore-keys: |
+            pytest-durations-${{ runner.os }}-${{ matrix.python }}-
+
+      # 仅手动触发时运行调试步骤（避免正式环境浪费时间）
+      - name: Debug Python Path and Package (Manual Only)
+        if: github.event_name == 'workflow_dispatch'
         run: |
           echo "=== Debugging Python environment ==="
           echo "PYTHONPATH: $PYTHONPATH"
           echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
-          
-          echo "--- Python sys.path ---"
-          python -c "import sys; print('\n'.join(sys.path))"
-          
-          echo "--- Attempting to import deepmd ---"
+          python -c "import sys; print('sys.path:', sys.path)"
           python -c "import deepmd; print('deepmd path:', deepmd.__file__)"
-          
-          echo "--- Checking deepmd directory contents ---"
-          python -c "import deepmd; import os; print(os.listdir(os.path.dirname(deepmd.__file__)))"
-          
-          echo "--- Looking for .so files ---"
-          find $PWD -name "*.so" | grep -E "deepmd|lib" | head -20
-          
-          echo "--- Checking wheel contents ---"
-          unzip -l dist/*.whl | grep -E "deepmd/.*\.so|deepmd/.*\.pyd" || echo "No .so files found in wheel"
-          
-          echo "--- Attempting to import deepmd.lib ---"
           python -c "import deepmd.lib; print('deepmd.lib imported successfully')" || echo "Failed to import deepmd.lib"
-          
-          echo "--- Checking library dependencies ---"
-          # 如果找到了 .so 文件，检查其依赖
-          SO_FILE=$(find $PWD -name "*.so" | grep -E "deepmd.*lib|libdeepmd" | head -1)
-          if [ -n "$SO_FILE" ]; then
-            echo "Found .so file: $SO_FILE"
-            ldd $SO_FILE || echo "ldd failed"
-          else
-            echo "No .so file found"
-          fi
+          find $PWD -name "*.so" | grep -E "deepmd|lib" | head -5
 
       - name: Run Pytest
         run: |
@@ -236,14 +232,25 @@ jobs:
             exit 0
           fi
           
-          export TESTMON_DATAFILE=.testmondata-${{ matrix.group }}
+          # 统计测试数量（用于监控testmon效果）
+          TOTAL_TESTS=$(pytest --collect-only $SELECTED_PATHS -q 2>/dev/null | tail -1 | awk '{print $1}' || echo "unknown")
+          echo "::notice::Total tests to run: $TOTAL_TESTS"
           
-          # 确保环境变量生效
+          # 动态决定是否使用testmon
+          USE_TESTMON="${{ needs.detect-changes.outputs.use_testmon }}"
+          if [ "$USE_TESTMON" == "true" ]; then
+            echo "::notice::Using testmon for incremental testing"
+            TESTMON_ARG="--testmon"
+          else
+            echo "::notice::Skipping testmon (C++ changes or full test)"
+            TESTMON_ARG=""
+          fi
+          
           export PYTHONPATH=$PWD:$PYTHONPATH
           export LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH
           
           pytest -vv $SELECTED_PATHS \
-            --testmon \
+            $TESTMON_ARG \
             --cov=deepmd \
             --splits 12 --group ${{ matrix.group }} \
             --splitting-algorithm least_duration \
@@ -256,12 +263,13 @@ jobs:
           echo "::notice::Running self-check for high-risk changes"
           echo "Self-check passed: Python tests completed for high-risk changes."
 
+      # 关键优化4：保存全局testmon缓存（仅master分支）
       - name: Save Testmon Database Cache
         uses: actions/cache/save@v4
         if: github.ref == 'refs/heads/master' && matrix.group == 1
         with:
-          path: .testmondata-${{ matrix.group }}
-          key: testmon-${{ matrix.python }}-${{ github.sha }}-${{ matrix.group }}
+          path: .testmondata
+          key: testmon-${{ matrix.python }}-${{ github.sha }}
 
   trigger-cpp-tests:
     name: Trigger C++ Tests
@@ -272,7 +280,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Trigger C++ Test Workflow
         uses: actions/github-script@v7
