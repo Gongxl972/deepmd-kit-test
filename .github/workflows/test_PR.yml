@@ -145,13 +145,14 @@ jobs:
 
       - name: Install with testmon
         run: |
-          # 方案A：先安装 deepmd-kit 依赖，最后强制重装 PyTorch 2.13.0 确保版本不被覆盖
+          # 修复：正常安装 PyTorch 2.13.0（不带 --force-reinstall --no-deps）
+          uv pip install --system torch==2.13.0 --prerelease=allow
+          # 安装 deepmd-kit 及其依赖组
           uv pip install --system -e . \
             --group pin_tensorflow_cpu \
             --group pin_pytorch_cpu \
             --torch-backend cpu \
             --prerelease=allow
-          uv pip install --system torch==2.13.0 --force-reinstall --no-deps
           echo "LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       - name: Run Incremental Pytest
@@ -220,7 +221,5 @@ jobs:
       - uses: re-actors/alls-green@v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          # 允许 trigger-full-tests 失败（它通常会被 skipped）
           allowed-failures: trigger-full-tests
-          # 修复：允许矩阵分片任务被跳过（skipped/neutral 状态不阻断门禁）
           allowed-skips: testpython-incremental
