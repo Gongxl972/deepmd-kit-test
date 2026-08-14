@@ -6,7 +6,7 @@ on:
       - "dependabot/**"
       - "pre-commit-ci-update-config"
   merge_group:
-  workflow_dispatch:  # 支持被 test_PR.yml 调用
+  workflow_dispatch:
     inputs:
       pr_number:
         description: 'PR number to test'
@@ -26,9 +26,10 @@ name: Test C++
 jobs:
   # ==================== 非内存泄漏检测（并行分片） ====================
   testcc:
-    name: Test C++ (Shard ${{ matrix.group }}, TF: ${{ matrix.enable_tensorflow }}, Torch: ${{ matrix.enable_pytorch }}, Paddle: ${{ matrix.enable_paddle }})
+    # ✅ 使用双引号包裹 job name，避免 YAML 解析错误
+    name: "Test C++ (Shard ${{ matrix.group }}, TF: ${{ matrix.enable_tensorflow }}, Torch: ${{ matrix.enable_pytorch }}, Paddle: ${{ matrix.enable_paddle }})"
     runs-on: ${{ github.repository_owner == 'deepmodeling' && 'cpu' || 'ubuntu-22.04' }}
-    timeout-minutes: 60  # ✅ Job 级别超时防线
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -53,7 +54,6 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      # ✅ ccache 加速 C++ 编译
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
@@ -82,7 +82,6 @@ jobs:
       - name: Convert models
         run: source/tests/infer/convert-models.sh
 
-      # ✅ C++ 测试并行（ctest -j）
       - run: |
           source/install/test_cc_local.sh
         env:
@@ -95,14 +94,12 @@ jobs:
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch && 'TRUE' || 'FALSE' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && 'TRUE' || 'FALSE' }}
 
-      # ✅ Paddle 库处理
       - run: |
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/paddle/lib/*.so ${{ github.workspace }}/dp_test/lib/
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/onednn/lib/* ${{ github.workspace }}/dp_test/lib/
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/mklml/lib/* ${{ github.workspace }}/dp_test/lib/
         if: matrix.enable_paddle
 
-      # ✅ 获取测试耗时缓存（稳定键名）
       - name: Get durations from cache
         uses: actions/cache@v6
         with:
@@ -112,7 +109,6 @@ jobs:
             testcc-durations-${{ github.sha }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_paddle }}-
             testcc-durations-${{ matrix.enable_tensorflow }}-${{ matrix.enable_paddle }}-
 
-      # ✅ LAMMPS 测试：并行分片 + 空分片容错
       - run: |
           export LD_LIBRARY_PATH=${{ github.workspace }}/dp_test/lib:$LD_LIBRARY_PATH
           source/install/retry_on_sigterm.sh 3 pytest \
@@ -127,7 +123,6 @@ jobs:
             --clean-durations \
             --durations-path=.test_durations_lmp
 
-          # ✅ 修复 Exit Code 5：空分片视为成功
           status=$?
           if [ $status -eq 5 ]; then
             echo "::notice::No tests collected in shard ${{ matrix.group }}, treating as success."
@@ -144,7 +139,6 @@ jobs:
           ENABLE_JAX: ${{ matrix.enable_tensorflow && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && '1' || '0' }}
 
-      # ✅ iPI 测试：并行分片 + 空分片容错
       - run: |
           export PATH=${{ github.workspace }}/dp_test/bin:$PATH
           pytest \
@@ -160,7 +154,6 @@ jobs:
             --clean-durations \
             --durations-path=.test_durations_ipi
 
-          # ✅ 修复 Exit Code 5：空分片视为成功
           status=$?
           if [ $status -eq 5 ]; then
             echo "::notice::No tests collected in shard ${{ matrix.group }}, treating as success."
@@ -177,7 +170,6 @@ jobs:
           ENABLE_JAX: ${{ matrix.enable_tensorflow && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && '1' || '0' }}
 
-      # ✅ 合并耗时文件
       - name: Combine shard durations
         run: |
           if [ -f .test_durations_lmp ] && [ -f .test_durations_ipi ]; then
@@ -206,9 +198,9 @@ jobs:
 
   # ==================== 内存泄漏检测（完全串行，独立 Job） ====================
   testcc-memleak:
-    name: Test C++ (Memleak, TF: ${{ matrix.enable_tensorflow }}, Torch: ${{ matrix.enable_pytorch }}, Paddle: ${{ matrix.enable_paddle }})
+    name: "Test C++ (Memleak, TF: ${{ matrix.enable_tensorflow }}, Torch: ${{ matrix.enable_pytorch }}, Paddle: ${{ matrix.enable_paddle }})"
     runs-on: ubuntu-22.04
-    timeout-minutes: 60  # ✅ Job 级别超时防线
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -252,11 +244,9 @@ jobs:
       - name: Convert models
         run: source/tests/infer/convert-models.sh
 
-      # ✅ Issue #9491 关键修复：仅 memleak 任务调整内核参数
       - name: Fix kernel mmap rnd bits
         run: sudo sysctl vm.mmap_rnd_bits=28
 
-      # ✅ C++ 测试串行（ASan 要求）
       - run: |
           source/install/test_cc_local.sh
         env:
@@ -270,14 +260,12 @@ jobs:
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch && 'TRUE' || 'FALSE' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && 'TRUE' || 'FALSE' }}
 
-      # ✅ Paddle 库处理
       - run: |
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/paddle/lib/*.so ${{ github.workspace }}/dp_test/lib/
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/onednn/lib/* ${{ github.workspace }}/dp_test/lib/
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/mklml/lib/* ${{ github.workspace }}/dp_test/lib/
         if: matrix.enable_paddle
 
-      # ✅ Python 测试串行（ASan 要求，不分片不并行）
       - run: |
           export LD_LIBRARY_PATH=${{ github.workspace }}/dp_test/lib:$LD_LIBRARY_PATH
           export PATH=${{ github.workspace }}/dp_test/bin:$PATH
@@ -308,7 +296,7 @@ jobs:
 
   # ==================== 合并耗时数据 ====================
   update_durations:
-    name: Combine and update C++ test durations
+    name: "Combine and update C++ test durations"
     runs-on: ubuntu-slim
     needs: testcc
     steps:
@@ -333,7 +321,7 @@ jobs:
           path: .test_durations
 
   pass:
-    name: Pass testing C++
+    name: "Pass testing C++"
     needs: [testcc, testcc-memleak, update_durations]
     runs-on: ubuntu-slim
     if: always()
