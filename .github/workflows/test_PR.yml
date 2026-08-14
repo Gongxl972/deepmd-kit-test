@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 关键：拉取完整历史，解决 git diff 报错
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -113,7 +113,7 @@ jobs:
       needs.detect-changes.outputs.run_full_tests != 'true' &&
       needs.detect-changes.outputs.use_testmon == 'true'
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         python: ["3.10"]
@@ -145,14 +145,13 @@ jobs:
 
       - name: Install with testmon
         run: |
-          # 关键修复：移除 [jax,torch] extras，避免 torch 版本冲突
-          # 使用 --prerelease=allow 允许安装 deepmd-kit 开发版
-          # 仅安装核心测试依赖和 CPU 版本的 torch/tensorflow
+          # 方案A：先安装 deepmd-kit 依赖，最后强制重装 PyTorch 2.13.0 确保版本不被覆盖
           uv pip install --system -e . \
             --group pin_tensorflow_cpu \
             --group pin_pytorch_cpu \
             --torch-backend cpu \
             --prerelease=allow
+          uv pip install --system torch==2.13.0 --force-reinstall --no-deps
           echo "LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       - name: Run Incremental Pytest
@@ -221,5 +220,7 @@ jobs:
       - uses: re-actors/alls-green@v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          # 仅允许纯调度 Job 失败，不影响代码质量门禁
+          # 允许 trigger-full-tests 失败（它通常会被 skipped）
           allowed-failures: trigger-full-tests
+          # 修复：允许矩阵分片任务被跳过（skipped/neutral 状态不阻断门禁）
+          allowed-skips: testpython-incremental
