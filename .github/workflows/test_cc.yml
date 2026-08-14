@@ -1,20 +1,10 @@
 name: Test C++
 
 on:
-  push:
-    branches-ignore:
-      - "gh-readonly-queue/**"
-      - "copilot/**"
-      - "dependabot/**"
-      - "pre-commit-ci-update-config"
-  workflow_dispatch:  # 支持被 test_PR.yml 调用
+  workflow_dispatch:
     inputs:
       pr_number:
-        description: 'PR number to test'
-        required: false
-        type: string
-      reason:
-        description: 'Reason for triggering'
+        description: "PR number"
         required: false
         type: string
 
@@ -24,10 +14,8 @@ concurrency:
 
 jobs:
   testcc:
-    # 修复语法：使用双引号包裹包含表达式的 name
     name: "Test C++ (Shard ${{ matrix.group }}, Memleak: ${{ matrix.check_memleak }}, TF: ${{ matrix.enable_tensorflow }}, Torch: ${{ matrix.enable_pytorch }}, Paddle: ${{ matrix.enable_paddle }})"
     runs-on: ${{ matrix.check_memleak == false && github.repository_owner == 'deepmodeling' && 'cpu' || 'ubuntu-22.04' }}
-    # 防无限挂起防线
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -52,17 +40,22 @@ jobs:
             enable_paddle: true
     steps:
       - uses: actions/checkout@v7
+      
       - name: Install GCC
         run: |
           sudo apt-get update
           sudo apt-get install --yes build-essential
         if: ${{ matrix.check_memleak == false && github.repository_owner == 'deepmodeling' }}
+        
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: "pip"
+          
       - uses: lukka/get-cmake@latest
+      
       - run: python -m pip install uv
+      
       - name: Install Python dependencies
         run: |
           source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu --torch-backend cpu
@@ -71,13 +64,16 @@ jobs:
           source/install/uv_with_retry.sh pip install --system -e .[cpu,test,lmp,jax,torch] mpi4py mpich
         env:
           DP_ENABLE_PYTORCH: 1
+          
       - name: Convert models
         run: source/tests/infer/convert-models.sh
+        
       - name: Fix kernel mmap rnd bits
         run: sudo sysctl vm.mmap_rnd_bits=28
         if: ${{ matrix.check_memleak }}
-      - run: |
-          source/install/test_cc_local.sh
+        
+      - name: Run C++ tests
+        run: source/install/test_cc_local.sh
         env:
           OMP_NUM_THREADS: 1
           TF_INTRA_OP_PARALLELISM_THREADS: 1
@@ -88,38 +84,33 @@ jobs:
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && 'TRUE' || 'FALSE' }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch && 'TRUE' || 'FALSE' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && 'TRUE' || 'FALSE' }}
-      
-      - run: |
+          
+      - name: Copy Paddle libs
+        run: |
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/paddle/lib/*.so ${{ github.workspace }}/dp_test/lib/
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/onednn/lib/* ${{ github.workspace }}/dp_test/lib/
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/mklml/lib/* ${{ github.workspace }}/dp_test/lib/
         if: matrix.enable_paddle
-
-      # 获取耗时缓存
-      - name: Get durations from cache
-        uses: actions/cache@v6
-        with:
-          path: .test_durations_cc
-          key: testcc-durations-split-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_paddle }}-${{ matrix.group }}
-          restore-keys: |
-            testcc-durations-combined-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_paddle }}-${{ github.sha }}
-            testcc-durations-combined-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_paddle }}
-        if: ${{ !matrix.check_memleak }}
-
-      # 运行 LAMMPS 测试（修复 exit code 5）
-      - run: |
+        
+      # ==================== LAMMPS 测试 (带容错) ====================
+      - name: Run LAMMPS tests
+        run: |
           export LD_LIBRARY_PATH=${{ github.workspace }}/dp_test/lib:$LD_LIBRARY_PATH
-          pytest --cov=deepmd source/lmp/tests \
-            --splits 12 \
-            --group ${{ matrix.group }} \
-            --splitting-algorithm least_duration \
-            --store-durations \
-            --clean-durations \
-            --durations-path=.test_durations_lmp \
-            --suppress-no-test-exit-code  # 方案B：直接抑制无测试退出码
+          
+          if [ "${{ matrix.check_memleak }}" != "true" ]; then
+            pytest --timeout=300 --cov=deepmd --cov-append source/lmp/tests \
+              --splits 12 \
+              --group ${{ matrix.group }} \
+              --splitting-algorithm least_duration \
+              --store-durations \
+              --clean-durations \
+              --durations-path=.test_durations_lmp
+          fi
+          
+          # 容错处理：如果当前分片没有分配到测试（退出码为 5），视为成功
           status=$?
           if [ $status -eq 5 ]; then
-            echo "No tests collected in this shard, ignoring exit code 5."
+            echo "No tests collected in this shard (LAMMPS), ignoring exit code 5."
             exit 0
           fi
           exit $status
@@ -133,21 +124,26 @@ jobs:
           ENABLE_JAX: ${{ matrix.enable_tensorflow && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && '1' || '0' }}
         if: ${{ !matrix.check_memleak }}
-
-      # 运行 iPI 测试（修复 exit code 5）
-      - run: |
+        
+      # ==================== iPI 测试 (带容错) ====================
+      - name: Run iPI tests
+        run: |
           export PATH=${{ github.workspace }}/dp_test/bin:$PATH
-          pytest --cov=deepmd --cov-append source/ipi/tests \
-            --splits 12 \
-            --group ${{ matrix.group }} \
-            --splitting-algorithm least_duration \
-            --store-durations \
-            --clean-durations \
-            --durations-path=.test_durations_ipi \
-            --suppress-no-test-exit-code  # 方案B：直接抑制无测试退出码
+          
+          if [ "${{ matrix.check_memleak }}" != "true" ]; then
+            pytest --timeout=300 --cov=deepmd --cov-append source/ipi/tests \
+              --splits 12 \
+              --group ${{ matrix.group }} \
+              --splitting-algorithm least_duration \
+              --store-durations \
+              --clean-durations \
+              --durations-path=.test_durations_ipi
+          fi
+          
+          # 容错处理：如果当前分片没有分配到测试（退出码为 5），视为成功
           status=$?
           if [ $status -eq 5 ]; then
-            echo "No tests collected in this shard, ignoring exit code 5."
+            echo "No tests collected in this shard (iPI), ignoring exit code 5."
             exit 0
           fi
           exit $status
@@ -161,8 +157,7 @@ jobs:
           ENABLE_JAX: ${{ matrix.enable_tensorflow && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && '1' || '0' }}
         if: ${{ !matrix.check_memleak }}
-
-      # 合并耗时
+        
       - name: Combine shard durations
         run: |
           if [ -f .test_durations_lmp ] && [ -f .test_durations_ipi ]; then
@@ -173,7 +168,7 @@ jobs:
             echo '{}' > .test_durations_cc_${{ matrix.group }}
           fi
         if: ${{ !matrix.check_memleak }}
-
+        
       - name: Upload partial durations
         uses: actions/upload-artifact@v7
         with:
@@ -181,28 +176,19 @@ jobs:
           path: .test_durations_cc_${{ matrix.group }}
           include-hidden-files: true
         if: ${{ !matrix.check_memleak }}
-
+        
       - name: Upload coverage to Codecov (non-blocking)
         uses: codecov/codecov-action@v7
         continue-on-error: true
         with:
           use_oidc: true
+          
     permissions:
       id-token: write
 
   update_durations:
     name: "Combine and update C++ test durations"
     runs-on: ubuntu-slim
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - check_memleak: false
-            enable_tensorflow: true
-            enable_paddle: false
-          - check_memleak: false
-            enable_tensorflow: false
-            enable_paddle: true
     needs: testcc
     steps:
       - name: Get durations from cache
@@ -211,11 +197,13 @@ jobs:
           path: .test_durations_cc
           key: testcc-durations-combined-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_paddle }}-${{ github.sha }}
           restore-keys: testcc-durations-combined-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_paddle }}
+          
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: split-cc-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_paddle }}-*
+          pattern: split-cc-*
           merge-multiple: true
+          
       - name: Combine test durations
         run: |
           if ls .test_durations_cc_* 1> /dev/null 2>&1; then
