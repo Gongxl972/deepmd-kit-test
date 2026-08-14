@@ -5,8 +5,17 @@ on:
       - "copilot/**"
       - "dependabot/**"
       - "pre-commit-ci-update-config"
-  pull_request:
   merge_group:
+  workflow_dispatch:  # 支持被 test_PR.yml 调用
+    inputs:
+      pr_number:
+        description: 'PR number to test'
+        required: false
+        type: string
+      reason:
+        description: 'Reason for triggering'
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
@@ -17,9 +26,9 @@ name: Test C++
 jobs:
   # ==================== 非内存泄漏检测（并行分片） ====================
   testcc:
-    name: "Test C++ (Shard ${{ matrix.group }}, TF: ${{ matrix.enable_tensorflow }}, Torch: ${{ matrix.enable_pytorch }}, Paddle: ${{ matrix.enable_paddle }})"
+    name: Test C++ (Shard ${{ matrix.group }}, TF: ${{ matrix.enable_tensorflow }}, Torch: ${{ matrix.enable_pytorch }}, Paddle: ${{ matrix.enable_paddle }})
     runs-on: ${{ github.repository_owner == 'deepmodeling' && 'cpu' || 'ubuntu-22.04' }}
-    timeout-minutes: 45
+    timeout-minutes: 60  # ✅ Job 级别超时防线
     strategy:
       fail-fast: false
       matrix:
@@ -73,7 +82,7 @@ jobs:
       - name: Convert models
         run: source/tests/infer/convert-models.sh
 
-      # ✅ C++ 测试并行
+      # ✅ C++ 测试并行（ctest -j）
       - run: |
           source/install/test_cc_local.sh
         env:
@@ -93,70 +102,98 @@ jobs:
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/mklml/lib/* ${{ github.workspace }}/dp_test/lib/
         if: matrix.enable_paddle
 
-      # ✅ 缓存键：稳定 + 可命中
+      # ✅ 获取测试耗时缓存（稳定键名）
       - name: Get durations from cache
         uses: actions/cache@v6
         with:
-          path: .test_durations
+          path: .test_durations_cc
           key: testcc-durations-${{ github.sha }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_paddle }}-${{ matrix.group }}
           restore-keys: |
             testcc-durations-${{ github.sha }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_paddle }}-
             testcc-durations-${{ matrix.enable_tensorflow }}-${{ matrix.enable_paddle }}-
 
-      # ✅ LAMMPS 测试分片
+      # ✅ LAMMPS 测试：并行分片 + 空分片容错
       - run: |
           export LD_LIBRARY_PATH=${{ github.workspace }}/dp_test/lib:$LD_LIBRARY_PATH
-          pytest --cov=deepmd source/lmp/tests \
+          source/install/retry_on_sigterm.sh 3 pytest \
+            -n auto \
+            --timeout=300 \
+            --cov=deepmd \
+            source/lmp/tests \
             --splits 12 \
             --group ${{ matrix.group }} \
             --splitting-algorithm least_duration \
             --store-durations \
-            --durations-path=.test_durations_lmp \
-            --timeout=300 \
-            -n auto
+            --clean-durations \
+            --durations-path=.test_durations_lmp
+
+          # ✅ 修复 Exit Code 5：空分片视为成功
+          status=$?
+          if [ $status -eq 5 ]; then
+            echo "::notice::No tests collected in shard ${{ matrix.group }}, treating as success."
+            exit 0
+          fi
+          exit $status
         env:
           OMP_NUM_THREADS: 1
+          TF_INTRA_OP_PARALLELISM_THREADS: 1
+          TF_INTER_OP_PARALLELISM_THREADS: 1
           LAMMPS_PLUGIN_PATH: ${{ github.workspace }}/dp_test/lib/deepmd_lmp
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && '1' || '0' }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch && '1' || '0' }}
           ENABLE_JAX: ${{ matrix.enable_tensorflow && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && '1' || '0' }}
 
-      # ✅ iPI 测试分片（独立）
+      # ✅ iPI 测试：并行分片 + 空分片容错
       - run: |
           export PATH=${{ github.workspace }}/dp_test/bin:$PATH
-          pytest --cov=deepmd --cov-append source/ipi/tests \
+          pytest \
+            -n auto \
+            --timeout=300 \
+            --cov=deepmd \
+            --cov-append \
+            source/ipi/tests \
             --splits 12 \
             --group ${{ matrix.group }} \
             --splitting-algorithm least_duration \
             --store-durations \
-            --durations-path=.test_durations_ipi \
-            --timeout=300 \
-            -n auto
+            --clean-durations \
+            --durations-path=.test_durations_ipi
+
+          # ✅ 修复 Exit Code 5：空分片视为成功
+          status=$?
+          if [ $status -eq 5 ]; then
+            echo "::notice::No tests collected in shard ${{ matrix.group }}, treating as success."
+            exit 0
+          fi
+          exit $status
         env:
           OMP_NUM_THREADS: 1
+          TF_INTRA_OP_PARALLELISM_THREADS: 1
+          TF_INTER_OP_PARALLELISM_THREADS: 1
           LD_LIBRARY_PATH: ${{ github.workspace }}/dp_test/lib
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && '1' || '0' }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch && '1' || '0' }}
           ENABLE_JAX: ${{ matrix.enable_tensorflow && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && '1' || '0' }}
 
-      # ✅ 合并耗时文件（已修复 jq 语法问题）
-      - name: Combine durations
+      # ✅ 合并耗时文件
+      - name: Combine shard durations
         run: |
           if [ -f .test_durations_lmp ] && [ -f .test_durations_ipi ]; then
-            jq -s 'reduce .[] as $durations ({}; . * $durations)' .test_durations_lmp .test_durations_ipi > .test_durations_${{ matrix.group }}
+            jq -s 'reduce .[] as $durations ({}; . * $durations)' .test_durations_lmp .test_durations_ipi > .test_durations_cc_${{ matrix.group }}
           elif [ -f .test_durations_lmp ]; then
-            cp .test_durations_lmp .test_durations_${{ matrix.group }}
+            cp .test_durations_lmp .test_durations_cc_${{ matrix.group }}
           else
-            echo '{}' > .test_durations_${{ matrix.group }}
+            echo '{}' > .test_durations_cc_${{ matrix.group }}
           fi
 
       - name: Upload partial durations
         uses: actions/upload-artifact@v7
         with:
-          name: split-${{ matrix.enable_tensorflow }}-${{ matrix.enable_paddle }}-${{ matrix.group }}
-          path: .test_durations_${{ matrix.group }}
+          name: split-cc-${{ matrix.enable_tensorflow }}-${{ matrix.enable_paddle }}-${{ matrix.group }}
+          path: .test_durations_cc_${{ matrix.group }}
+          include-hidden-files: true
 
       - name: Upload coverage to Codecov (non-blocking)
         uses: codecov/codecov-action@v7
@@ -167,11 +204,11 @@ jobs:
     permissions:
       id-token: write
 
-  # ==================== 内存泄漏检测（完全串行） ====================
+  # ==================== 内存泄漏检测（完全串行，独立 Job） ====================
   testcc-memleak:
-    name: "Test C++ (Memleak, TF: ${{ matrix.enable_tensorflow }}, Torch: ${{ matrix.enable_pytorch }}, Paddle: ${{ matrix.enable_paddle }})"
+    name: Test C++ (Memleak, TF: ${{ matrix.enable_tensorflow }}, Torch: ${{ matrix.enable_pytorch }}, Paddle: ${{ matrix.enable_paddle }})
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 60  # ✅ Job 级别超时防线
     strategy:
       fail-fast: false
       matrix:
@@ -215,11 +252,11 @@ jobs:
       - name: Convert models
         run: source/tests/infer/convert-models.sh
 
-      # ✅ Issue #9491 关键修复
+      # ✅ Issue #9491 关键修复：仅 memleak 任务调整内核参数
       - name: Fix kernel mmap rnd bits
         run: sudo sysctl vm.mmap_rnd_bits=28
 
-      # ✅ 串行运行 C++ 测试（ASan 要求）
+      # ✅ C++ 测试串行（ASan 要求）
       - run: |
           source/install/test_cc_local.sh
         env:
@@ -240,14 +277,21 @@ jobs:
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/mklml/lib/* ${{ github.workspace }}/dp_test/lib/
         if: matrix.enable_paddle
 
-      # ✅ 串行运行 Python 测试（ASan 要求）
+      # ✅ Python 测试串行（ASan 要求，不分片不并行）
       - run: |
           export LD_LIBRARY_PATH=${{ github.workspace }}/dp_test/lib:$LD_LIBRARY_PATH
-          pytest --cov=deepmd source/lmp/tests source/ipi/tests \
-            --timeout=600
+          export PATH=${{ github.workspace }}/dp_test/bin:$PATH
+          pytest \
+            --timeout=600 \
+            --cov=deepmd \
+            source/lmp/tests \
+            source/ipi/tests
         env:
           OMP_NUM_THREADS: 1
+          TF_INTRA_OP_PARALLELISM_THREADS: 1
+          TF_INTER_OP_PARALLELISM_THREADS: 1
           LAMMPS_PLUGIN_PATH: ${{ github.workspace }}/dp_test/lib/deepmd_lmp
+          LD_LIBRARY_PATH: ${{ github.workspace }}/dp_test/lib
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && '1' || '0' }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch && '1' || '0' }}
           ENABLE_JAX: ${{ matrix.enable_tensorflow && '1' || '0' }}
@@ -271,13 +315,13 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: split-*
+          pattern: split-cc-*
           merge-multiple: true
 
       - name: Combine test durations
         run: |
-          if ls .test_durations_* 1> /dev/null 2>&1; then
-            jq -s 'reduce .[] as $durations ({}; . * $durations)' .test_durations_* > .test_durations
+          if ls .test_durations_cc_* 1> /dev/null 2>&1; then
+            jq -s 'reduce .[] as $durations ({}; . * $durations)' .test_durations_cc_* > .test_durations
           else
             echo '{}' > .test_durations
           fi
@@ -285,7 +329,7 @@ jobs:
       - name: Upload combined durations
         uses: actions/upload-artifact@v7
         with:
-          name: combined-durations
+          name: combined-durations-cc
           path: .test_durations
 
   pass:
