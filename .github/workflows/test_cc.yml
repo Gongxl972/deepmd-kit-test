@@ -69,7 +69,7 @@ jobs:
       - name: "Fix kernel mmap rnd bits"
         run: sudo sysctl vm.mmap_rnd_bits=28
         if: ${{ matrix.check_memleak }}
-      # 编译（只编译，不运行测试）
+      # 编译（移除 BUILD_ONLY，让脚本正常编译并生成 build_tests）
       - name: "Compile C++ library and unit test binaries"
         run: source/install/test_cc_local.sh
         env:
@@ -82,11 +82,15 @@ jobs:
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && 'TRUE' || 'FALSE' }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch && 'TRUE' || 'FALSE' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && 'TRUE' || 'FALSE' }}
-          BUILD_ONLY: TRUE
-      # 收集单元测试时长（用于后续分片，只在非 memleak 组执行一次）
+      # 收集单元测试时长（使用 working-directory 和防御性检查，允许失败）
       - name: "Collect unit test durations"
+        working-directory: ${{ github.workspace }}/build_tests
+        continue-on-error: true
         run: |
-          cd ${{ github.workspace }}/build_tests
+          if [ ! -f "CTestTestfile.cmake" ]; then
+            echo "No CTest configuration found, skipping duration collection."
+            exit 0
+          fi
           ctest --output-json=../.test_durations_unit.json --force-new-ctest-process
         if: ${{ !matrix.check_memleak }}
       # 拷贝 Paddle 库（前置）
@@ -270,13 +274,13 @@ jobs:
           restore-keys: testcc-durations-
 
   # ============================================================
-  # 6. 汇总 pass job
+  # 6. 汇总 pass job（始终运行，汇总所有 needs 状态）
   # ============================================================
   pass:
     name: "Pass testing C++"
     needs: [build, test_unit, test_lammps, test_ipi, update_durations]
-    runs-on: ubuntu-slim
     if: always()
+    runs-on: ubuntu-slim
     steps:
       - uses: re-actors/alls-green@release/v1
         with:
