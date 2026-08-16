@@ -126,6 +126,13 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ccache-${{ runner.os }}-testmon-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-testmon-
+
       - name: Restore Testmon Database
         uses: actions/cache/restore@v4
         with:
@@ -143,12 +150,31 @@ jobs:
 
       - run: python -m pip install -U uv pytest-testmon array-api-strict pytest-split pytest-cov
 
-      - name: Install with testmon
+      # ---------- 优先使用缓存 wheel ----------
+      - name: Try download cached wheel
+        id: download-wheel
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: cached-wheel-py${{ matrix.python }}
+          path: dist/
+
+      - name: Install with testmon (cached wheel)
+        if: steps.download-wheel.outcome == 'success'
         run: |
-          # 修复：正常安装 PyTorch 2.13.0（不带 --force-reinstall --no-deps）
-          uv pip install --system torch==2.13.0 --prerelease=allow
-          # 安装 deepmd-kit 及其依赖组
+          uv pip install --system dist/*.whl \
+            --group pin_tensorflow_cpu \
+            --group pin_pytorch_cpu \
+            --torch-backend cpu \
+            --prerelease=allow
+          echo "LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
+      - name: Install with testmon (fallback to source build)
+        if: steps.download-wheel.outcome != 'success'
+        run: |
+          uv pip install --system --group pin_pytorch_cpu --torch-backend cpu --prerelease=allow
           uv pip install --system -e . \
+            --no-binary deepmd-kit \
             --group pin_tensorflow_cpu \
             --group pin_pytorch_cpu \
             --torch-backend cpu \
