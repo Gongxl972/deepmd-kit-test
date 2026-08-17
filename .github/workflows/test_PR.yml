@@ -189,13 +189,21 @@ jobs:
             exit 0
           fi
 
+          # 运行 pytest，捕获 exit code 5（空分片）并视为成功
           pytest -vv $SELECTED_PATHS \
             --testmon \
             --cov=deepmd \
             --splits 12 --group ${{ matrix.group }} \
             --splitting-algorithm least_duration \
             --disable-warnings \
-            --ignore=source/tests/test_force_fail.py
+            --ignore=source/tests/test_force_fail.py || {
+              status=$?
+              if [ $status -eq 5 ]; then
+                echo "::notice::No tests collected in this shard, treating as success."
+                exit 0
+              fi
+              exit $status
+            }
 
       - name: Save Testmon Database Cache
         uses: actions/cache/save@v4
@@ -248,4 +256,5 @@ jobs:
         with:
           jobs: ${{ toJSON(needs) }}
           allowed-failures: trigger-full-tests
-          allowed-skips: testpython-incremental
+          # 允许 testpython-incremental 和 trigger-full-tests 被跳过
+          allowed-skips: testpython-incremental, trigger-full-tests
