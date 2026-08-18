@@ -144,6 +144,13 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: ${{ steps.artifact.outputs.name }}
+      # ========== 新增调试步骤 ==========
+      - name: "List files after download (Debug)"
+        run: |
+          pwd
+          ls -la
+          find . -maxdepth 3 -type d -name "*build*"
+      # ==================================
       - name: "Run unit tests (shard ${{ matrix.group }})"
         run: |
           cd build_tests
