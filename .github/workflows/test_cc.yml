@@ -4,61 +4,63 @@ on:
   pull_request:
   push:
     branches:
-      - '**'  # 触发所有分支的 push 事件
+      - '**'  # 所有分支触发
 
 permissions:
   id-token: write
 
 jobs:
   # ============================================================
-  # 1. 构建 C++ (分离构建与测试)
+  # 1. 构建 C++（只构建测试所需的后端组合）
   # ============================================================
   build:
-    name: "Build C++ (Memleak:${{ matrix.check_memleak }}, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
+    name: "Build C++ (${{ matrix.label }})"
     runs-on: ubuntu-slim
     strategy:
       fail-fast: false
       matrix:
-        check_memleak: [false] # 测试仅依赖 false，避免构建无用的 true 版本浪费资源
-        enable_tensorflow: [true, false]
-        enable_pytorch: [true, false]
-        enable_paddle: [true, false]
-        exclude:
-          - enable_tensorflow: true
+        include:
+          - label: "tf_torch"
+            check_memleak: false
+            enable_tensorflow: true
             enable_pytorch: true
-          - enable_tensorflow: true
-            enable_paddle: true
-          - enable_pytorch: true
-            enable_paddle: true
-          - enable_tensorflow: false
-            enable_pytorch: false
             enable_paddle: false
+          - label: "paddle"
+            check_memleak: false
+            enable_tensorflow: false
+            enable_pytorch: false
+            enable_paddle: true
     steps:
-      - uses: actions/checkout@v4 # 修正：v7 不存在，改用稳定版 v4
-      - name: "Install GCC"
-        if: matrix.check_memleak == true
-        run: sudo apt-get update && sudo apt-get install -y gcc-10 g++-10
+      - uses: actions/checkout@v4
       - name: "Fix kernel mmap rnd bits"
         run: sudo sysctl vm.mmap_rnd_bits=28
       - name: "Convert models"
         run: source/install/convert_models.sh
       - name: "Build C++"
         run: |
-          mkdir build_tests
+          mkdir -p build_tests
           cd build_tests
           cmake ..
           make -j$(nproc)
         env:
           TF_INTRA_OP_PARALLELISM_THREADS: 1
           TF_INTER_OP_PARALLELISM_THREADS: 1
+          ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && '1' || '0' }}
+          ENABLE_PYTORCH: ${{ matrix.enable_pytorch && '1' || '0' }}
+          ENABLE_PADDLE: ${{ matrix.enable_paddle && '1' || '0' }}
       - name: "Copy Paddle libs if needed"
         if: matrix.enable_paddle == true
-        run: cp build_tests/paddle/* dp_test/lib/ || true
+        run: |
+          mkdir -p dp_test/lib
+          cp build_tests/paddle/* dp_test/lib/ || true
       - name: "Upload build artifact"
         uses: actions/upload-artifact@v7
         with:
-          name: build-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_paddle }}
-          path: build_tests/
+          name: build-false-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_paddle }}
+          path: |
+            build_tests/
+            dp_test/  # 包含 dp_test 目录（如果有）
+          include-hidden-files: true
 
   # ============================================================
   # 2. 单元测试 (分片)
@@ -86,10 +88,8 @@ jobs:
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ./build_download
-      - name: "Setup dp_test/lib dependencies (Placeholder)"
-        run: |
-          mkdir -p dp_test/lib
-          # TODO: 如果需要动态库，请在此处添加下载或复制依赖库的实际命令
+      - name: "Ensure dp_test/lib exists"
+        run: mkdir -p dp_test/lib
       - name: "List files after download (Debug)"
         run: |
           pwd
@@ -130,10 +130,8 @@ jobs:
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ./build_download
-      - name: "Setup dp_test/lib dependencies (Placeholder)"
-        run: |
-          mkdir -p dp_test/lib
-          # TODO: 补充真实的依赖库下载逻辑
+      - name: "Ensure dp_test/lib exists"
+        run: mkdir -p dp_test/lib
       - name: "List files after download (Debug)"
         run: |
           pwd
@@ -195,10 +193,8 @@ jobs:
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ./build_download
-      - name: "Setup dp_test/lib dependencies (Placeholder)"
-        run: |
-          mkdir -p dp_test/lib
-          # TODO: 补充真实的依赖库下载逻辑
+      - name: "Ensure dp_test/lib exists"
+        run: mkdir -p dp_test/lib
       - name: "List files after download (Debug)"
         run: |
           pwd
