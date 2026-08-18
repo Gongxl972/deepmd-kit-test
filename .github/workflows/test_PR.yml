@@ -11,6 +11,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ==================== 前置：构建缓存 wheel ====================
+  build-cache:
+    name: Build Cache Wheel
+    runs-on: ubuntu-22.04
+    if: |
+      github.event_name == 'pull_request' &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-ci')
+    outputs:
+      cache_key: ${{ steps.build.outputs.cache_key }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install -U uv
+      - name: Build wheel
+        id: build
+        run: |
+          # 1. 安装构建工具
+          pip install --force-reinstall build wheel packaging
+
+          # 2. 显式锁定 PyTorch 版本（与项目编译时版本一致）
+          uv pip install --system torch==2.11.0 --torch-backend cpu
+
+          # 3. 安装项目依赖组
+          uv pip install --system --group pin_pytorch_cpu --torch-backend cpu --prerelease=allow
+
+          # 4. 清理本地 build 目录，防止冲突
+          rm -rf build/
+
+          # 5. 编译 wheel
+          python -m build --wheel --outdir dist/
+
+          # 6. 输出缓存标识（便于调试）
+          echo "cache_key=cached-wheel-py3.10-${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Upload wheel as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cached-wheel-py3.10
+          path: dist/*.whl
+          retention-days: 1   # 只需保留到本次运行结束
+
+  # ==================== 检测变更 ====================
   detect-changes:
     name: Detect Changes
     runs-on: ubuntu-22.04
@@ -104,10 +148,11 @@ jobs:
           echo "trigger_cpp_tests=false" >> $GITHUB_OUTPUT
           echo "test_change_risk=low" >> $GITHUB_OUTPUT
 
+  # ==================== 增量测试（使用缓存 wheel） ====================
   testpython-incremental:
     name: Test Python (Incremental)
     runs-on: ubuntu-22.04
-    needs: [detect-changes]
+    needs: [detect-changes, build-cache]   # 依赖 build-cache 确保缓存就绪
     if: |
       needs.detect-changes.outputs.skip_all != 'true' &&
       needs.detect-changes.outputs.run_full_tests != 'true' &&
@@ -150,31 +195,17 @@ jobs:
 
       - run: python -m pip install -U uv pytest-testmon array-api-strict pytest-split pytest-cov
 
-      # ---------- 优先使用缓存 wheel ----------
-      - name: Try download cached wheel
+      # ---------- 从同一个工作流下载缓存 wheel ----------
+      - name: Download cached wheel
         id: download-wheel
-        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: cached-wheel-py${{ matrix.python }}
           path: dist/
 
       - name: Install with testmon (cached wheel)
-        if: steps.download-wheel.outcome == 'success'
         run: |
           uv pip install --system dist/*.whl \
-            --group pin_tensorflow_cpu \
-            --group pin_pytorch_cpu \
-            --torch-backend cpu \
-            --prerelease=allow
-          echo "LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH" >> $GITHUB_ENV
-
-      - name: Install with testmon (fallback to source build)
-        if: steps.download-wheel.outcome != 'success'
-        run: |
-          uv pip install --system --group pin_pytorch_cpu --torch-backend cpu --prerelease=allow
-          uv pip install --system -e . \
-            --no-binary deepmd-kit \
             --group pin_tensorflow_cpu \
             --group pin_pytorch_cpu \
             --torch-backend cpu \
@@ -212,6 +243,7 @@ jobs:
           path: .testmondata
           key: testmon-${{ matrix.python }}-${{ github.sha }}
 
+  # ==================== 触发全量测试（当 C++ 变更时） ====================
   trigger-full-tests:
     name: Trigger Full Tests
     runs-on: ubuntu-latest
@@ -246,10 +278,11 @@ jobs:
             })
             console.log('Successfully triggered full tests: ${{ matrix.workflow }}')
 
+  # ==================== 汇总门禁 ====================
   pass:
     name: Pass testing Python
     runs-on: ubuntu-latest
-    needs: [detect-changes, testpython-incremental, trigger-full-tests]
+    needs: [detect-changes, build-cache, testpython-incremental, trigger-full-tests]
     if: always()
     steps:
       - uses: re-actors/alls-green@v1.2.2
