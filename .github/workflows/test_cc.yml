@@ -4,7 +4,7 @@ on:
   pull_request:
   push:
     branches:
-      - master
+      - '**'  # 触发所有分支的 push 事件
 
 permissions:
   id-token: write
@@ -14,12 +14,12 @@ jobs:
   # 1. 构建 C++ (分离构建与测试)
   # ============================================================
   build:
-    name: "Build C++ (true, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
+    name: "Build C++ (Memleak:${{ matrix.check_memleak }}, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
     runs-on: ubuntu-slim
     strategy:
       fail-fast: false
       matrix:
-        check_memleak: [true, false]
+        check_memleak: [false] # 测试仅依赖 false，避免构建无用的 true 版本浪费资源
         enable_tensorflow: [true, false]
         enable_pytorch: [true, false]
         enable_paddle: [true, false]
@@ -34,7 +34,7 @@ jobs:
             enable_pytorch: false
             enable_paddle: false
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4 # 修正：v7 不存在，改用稳定版 v4
       - name: "Install GCC"
         if: matrix.check_memleak == true
         run: sudo apt-get update && sudo apt-get install -y gcc-10 g++-10
@@ -57,7 +57,6 @@ jobs:
       - name: "Upload build artifact"
         uses: actions/upload-artifact@v7
         with:
-          # 匹配下游期望的四字段名称
           name: build-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_paddle }}
           path: build_tests/
 
@@ -74,7 +73,7 @@ jobs:
         backend_id: [tf_torch, paddle]
         shard: [1, 2, 3, 4]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
       - name: "Determine artifact name"
         id: artifact
         run: |
@@ -86,26 +85,24 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: ${{ steps.artifact.outputs.name }}
-          path: ./build_download # 明确指定下载目录
+          path: ./build_download
+      - name: "Setup dp_test/lib dependencies (Placeholder)"
+        run: |
+          mkdir -p dp_test/lib
+          # TODO: 如果需要动态库，请在此处添加下载或复制依赖库的实际命令
       - name: "List files after download (Debug)"
         run: |
           pwd
           ls -la
           find . -maxdepth 3 -type d
       - name: "Run unit tests (shard ${{ matrix.shard }})"
-        working-directory: ./build_download # 直接在实际解压目录运行
+        working-directory: ./build_download
         run: |
           ctest -R "^unit_test_shard_${{ matrix.shard }}$" --output-on-failure
         env:
           OMP_NUM_THREADS: 1
           TF_INTRA_OP_PARALLELISM_THREADS: 1
           TF_INTER_OP_PARALLELISM_THREADS: 1
-      - name: "Upload unit test durations"
-        uses: actions/upload-artifact@v7
-        with:
-          name: durations-unit-${{ matrix.backend_id }}-${{ matrix.shard }}
-          path: ./build_download/.test_durations_unit
-          include-hidden-files: true
 
   # ============================================================
   # 3. LAMMPS 测试 (分片)
@@ -120,7 +117,7 @@ jobs:
         backend_id: [tf_torch, paddle]
         group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
       - name: "Determine artifact name"
         id: artifact
         run: |
@@ -133,6 +130,10 @@ jobs:
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ./build_download
+      - name: "Setup dp_test/lib dependencies (Placeholder)"
+        run: |
+          mkdir -p dp_test/lib
+          # TODO: 补充真实的依赖库下载逻辑
       - name: "List files after download (Debug)"
         run: |
           pwd
@@ -165,7 +166,7 @@ jobs:
         uses: codecov/codecov-action@v7
         continue-on-error: true
         with:
-          use_oidc: true
+          use-oidc: true
           flags: lammps,${{ matrix.backend_id }},shard${{ matrix.group }}
 
   # ============================================================
@@ -181,7 +182,7 @@ jobs:
         backend_id: [tf_torch, paddle]
         group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
       - name: "Determine artifact name"
         id: artifact
         run: |
@@ -194,6 +195,10 @@ jobs:
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ./build_download
+      - name: "Setup dp_test/lib dependencies (Placeholder)"
+        run: |
+          mkdir -p dp_test/lib
+          # TODO: 补充真实的依赖库下载逻辑
       - name: "List files after download (Debug)"
         run: |
           pwd
@@ -226,7 +231,7 @@ jobs:
         uses: codecov/codecov-action@v7
         continue-on-error: true
         with:
-          use_oidc: true
+          use-oidc: true
           flags: ipi,${{ matrix.backend_id }},shard${{ matrix.group }}
 
   # ============================================================
