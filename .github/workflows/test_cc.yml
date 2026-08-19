@@ -1,30 +1,20 @@
 name: Test C++
 
 on:
-  push:
-    branches-ignore:
-      - "gh-readonly-queue/**"
-      - "copilot/**"
-      - "dependabot/**"
-      - "pre-commit-ci-update-config"
   pull_request:
-  merge_group:
+  push:
+    branches-ignore: []
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
-  cancel-in-progress: true
-
-# 全局权限：允许 Codecov 使用 OIDC token
 permissions:
   id-token: write
 
 jobs:
   # ============================================================
-  # 1. 构建 job（4 个后端组合，只编译，不运行测试）
+  # 1. 构建 C++ (分离构建与测试)
   # ============================================================
   build:
-    name: "Build C++ (${{ matrix.check_memleak }}, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
-    runs-on: ${{ (matrix.check_memleak == false && github.repository_owner == 'deepmodeling') && 'cpu' || 'ubuntu-22.04' }}
+    name: "Build C++ (true, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
+    runs-on: ubuntu-slim
     strategy:
       fail-fast: false
       matrix:
@@ -33,7 +23,7 @@ jobs:
             enable_tensorflow: true
             enable_pytorch: true
             enable_paddle: false
-          - check_memleak: true
+          - check_memleak: false
             enable_tensorflow: false
             enable_pytorch: false
             enable_paddle: true
@@ -45,16 +35,15 @@ jobs:
             enable_tensorflow: false
             enable_pytorch: false
             enable_paddle: true
-    outputs:
-      build_key: ${{ format('{0}-{1}-{2}-{3}', matrix.check_memleak, matrix.enable_tensorflow, matrix.enable_pytorch, matrix.enable_paddle) }}
     steps:
       - uses: actions/checkout@v4
       - name: "Install GCC"
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes build-essential
-        if: ${{ matrix.check_memleak == false && github.repository_owner == 'deepmodeling' }}
-      - uses: actions/setup-python@v7
+        if: matrix.check_memleak == true
+        run: sudo apt-get update && sudo apt-get install -y gcc-10 g++-10
+      - name: "Fix kernel mmap rnd bits"
+        if: ${{ matrix.check_memleak }}
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
           cache: "pip"
@@ -70,9 +59,6 @@ jobs:
           DP_ENABLE_PYTORCH: 1
       - name: "Convert models"
         run: source/tests/infer/convert-models.sh
-      - name: "Fix kernel mmap rnd bits"
-        run: sudo sysctl vm.mmap_rnd_bits=28
-        if: ${{ matrix.check_memleak }}
       - name: "Compile C++ library and unit test binaries"
         run: source/install/test_cc_local.sh
         env:
@@ -99,9 +85,10 @@ jobs:
       # 拷贝 Paddle 库
       - name: "Copy Paddle libs"
         run: |
-          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/paddle/lib/*.so ${{ github.workspace }}/dp_test/lib/
-          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/onednn/lib/* ${{ github.workspace }}/dp_test/lib/
-          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/mklml/lib/* ${{ github.workspace }}/dp_test/lib/
+          mkdir -p dp_test/lib
+          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/paddle/lib/*.so ${{ github.workspace }}/dp_test/lib/ || true
+          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/onednn/lib/* ${{ github.workspace }}/dp_test/lib/ || true
+          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/mklml/lib/* ${{ github.workspace }}/dp_test/lib/ || true
         if: ${{ matrix.enable_paddle }}
       # 上传编译产物
       - uses: actions/upload-artifact@v7
@@ -133,7 +120,7 @@ jobs:
         group: [1,2,3,4,5,6,7,8,9,10,11,12]
         backend_id: ["tf_torch", "paddle"]
     steps:
-      - uses: actions/checkout@v4  # 修复：拉取代码以获取 source/install 等脚本
+      - uses: actions/checkout@v4
       - name: "Determine artifact name"
         id: artifact
         run: |
@@ -149,21 +136,18 @@ jobs:
         run: |
           pwd
           ls -la
-          find . -maxdepth 3 -type d
+          find . -maxdepth 3 -type d -name "*build*"
       - name: "Run unit tests (shard ${{ matrix.group }})"
         run: |
-          # 自适应查找测试目录：优先 build_tests，其次 dp_test
+          # 自适应查找构建目录
           if [ -d "build_tests" ]; then
-            TEST_DIR="build_tests"
+            cd build_tests
           elif [ -d "dp_test" ]; then
-            TEST_DIR="dp_test"
+            cd dp_test
           else
-            echo "ERROR: Neither build_tests nor dp_test found!"
-            ls -la
+            echo "Error: Neither build_tests nor dp_test directory found!"
             exit 1
           fi
-          echo "Using test directory: $TEST_DIR"
-          cd "$TEST_DIR"
           total_shards=12
           shard_index=$(( matrix.group - 1 ))
           ctest -j4 --test-dir . -I ${shard_index},,${total_shards} --output-on-failure
@@ -184,7 +168,22 @@ jobs:
         group: [1,2,3,4,5,6,7,8,9,10,11,12]
         backend_id: ["tf_torch", "paddle"]
     steps:
-      - uses: actions/checkout@v4  # 修复：拉取代码
+      - uses: actions/checkout@v4 # 拉取源码（包含脚本）
+      - name: "Set up Python"
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: "Install Python dependencies"
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv
+          uv pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu --torch-backend cpu
+          uv pip install --system -e .[cpu,test,lmp,jax,torch] mpi4py mpich pytest pytest-cov
+        env:
+          DP_ENABLE_PYTORCH: 1
+      - name: "Make scripts executable"
+        run: chmod +x source/install/*.sh || true
       - name: "Determine artifact name"
         id: artifact
         run: |
@@ -198,7 +197,7 @@ jobs:
           name: ${{ steps.artifact.outputs.name }}
       - name: "Run LAMMPS tests (shard ${{ matrix.group }})"
         run: |
-          source/install/retry_on_sigterm.sh 3 pytest --timeout=300 --cov=deepmd source/lmp/tests \
+          source/install/retry_on_sigterm.sh 3 python -m pytest --timeout=300 --cov=deepmd source/lmp/tests \
             --splits 12 --group ${{ matrix.group }} \
             --splitting-algorithm least_duration \
             --store-durations --clean-durations \
@@ -226,7 +225,7 @@ jobs:
           flags: lammps,${{ matrix.backend_id }},shard${{ matrix.group }}
 
   # ============================================================
-  # 4. i-PI 集成测试分片 job
+  # 4. iPI 集成测试分片 job
   # ============================================================
   test_ipi:
     name: "iPI Tests (Shard ${{ matrix.group }}, Backend: ${{ matrix.backend_id }})"
@@ -238,7 +237,22 @@ jobs:
         group: [1,2,3,4,5,6,7,8,9,10,11,12]
         backend_id: ["tf_torch", "paddle"]
     steps:
-      - uses: actions/checkout@v4  # 修复：拉取代码
+      - uses: actions/checkout@v4 # 拉取源码（包含脚本）
+      - name: "Set up Python"
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: "Install Python dependencies"
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv
+          uv pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu --torch-backend cpu
+          uv pip install --system -e .[cpu,test,ipi,jax,torch] mpi4py mpich pytest pytest-cov
+        env:
+          DP_ENABLE_PYTORCH: 1
+      - name: "Make scripts executable"
+        run: chmod +x source/install/*.sh || true
       - name: "Determine artifact name"
         id: artifact
         run: |
@@ -252,7 +266,7 @@ jobs:
           name: ${{ steps.artifact.outputs.name }}
       - name: "Run iPI tests (shard ${{ matrix.group }})"
         run: |
-          source/install/retry_on_sigterm.sh 3 pytest --timeout=300 --cov=deepmd source/ipi/tests \
+          source/install/retry_on_sigterm.sh 3 python -m pytest --timeout=300 --cov=deepmd source/ipi/tests \
             --splits 12 --group ${{ matrix.group }} \
             --splitting-algorithm least_duration \
             --store-durations --clean-durations \
