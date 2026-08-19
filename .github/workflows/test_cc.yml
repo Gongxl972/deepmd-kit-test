@@ -1,16 +1,25 @@
 name: Test C++
 
 on:
-  pull_request:
   push:
-    branches-ignore: []
+    branches-ignore:
+      - "gh-readonly-queue/**"
+      - "copilot/**"
+      - "dependabot/**"
+      - "pre-commit-ci-update-config"
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
   id-token: write
 
 jobs:
   # ============================================================
-  # 1. 构建 C++ (只编译，不测试)
+  # 1. 构建 C++（4 个后端组合）
   # ============================================================
   build:
     name: "Build C++ (${{ matrix.check_memleak }}, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
@@ -35,6 +44,8 @@ jobs:
             enable_tensorflow: false
             enable_pytorch: false
             enable_paddle: true
+    outputs:
+      build_key: ${{ format('{0}-{1}-{2}-{3}', matrix.check_memleak, matrix.enable_tensorflow, matrix.enable_pytorch, matrix.enable_paddle) }}
     steps:
       - uses: actions/checkout@v4
       - name: "Install GCC"
@@ -73,7 +84,7 @@ jobs:
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && 'TRUE' || 'FALSE' }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch && 'TRUE' || 'FALSE' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && 'TRUE' || 'FALSE' }}
-      # 收集单元测试时长（用于后续分片）
+      # 收集单元测试时长
       - name: "Collect unit test durations"
         working-directory: ${{ github.workspace }}/build_tests
         continue-on-error: true
@@ -101,6 +112,13 @@ jobs:
             build_tests/
             .test_durations_unit.json
           include-hidden-files: true
+      # 上传单元测试 durations
+      - uses: actions/upload-artifact@v7
+        with:
+          name: durations-unit-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_paddle }}
+          path: .test_durations_unit.json
+          include-hidden-files: true
+        if: ${{ !matrix.check_memleak }}
 
   # ============================================================
   # 2. 合并所有测试（单元测试 + LAMMPS + iPI）分片运行
@@ -127,51 +145,69 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: ${{ steps.artifact.outputs.name }}
-      - name: "List downloaded files (Debug)"
+          path: ./downloaded_artifact  # 显式指定下载目录，避免解压混乱
+      - name: "Debug: List all downloaded files"
         run: |
-          pwd
-          ls -la
-          find . -maxdepth 3 -type d
+          echo "Current directory: $(pwd)"
+          ls -R ./downloaded_artifact
+      - name: "Find build_tests directory"
+        id: find_build
+        run: |
+          BUILD_DIR=$(find . -type d -name "build_tests" | head -n 1)
+          if [ -z "$BUILD_DIR" ]; then
+            echo "Error: build_tests directory not found!"
+            echo "Searching for test executables..."
+            find . -type f -executable -name "*test*" || true
+            exit 1
+          fi
+          echo "Found build_tests at: $BUILD_DIR"
+          echo "path=$BUILD_DIR" >> $GITHUB_OUTPUT
+      - name: "Install Python dependencies"
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-timeout pytest-cov
+      - name: "Make scripts executable"
+        run: chmod +x source/install/*.sh || true
       # ---------- 单元测试 ----------
       - name: "Run unit tests (shard ${{ matrix.shard }})"
+        working-directory: ${{ steps.find_build.outputs.path }}
         run: |
-          cd build_tests
-          total_shards=12
-          shard_index=$(( matrix.shard - 1 ))
-          ctest -j4 --test-dir . -I ${shard_index},,${total_shards} --output-on-failure
+          ctest -j4 --test-dir . -I $(( matrix.shard - 1 )),,12 --output-on-failure
         env:
           OMP_NUM_THREADS: 1
-          LD_LIBRARY_PATH: ${{ github.workspace }}/dp_test/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/downloaded_artifact/dp_test/lib
       # ---------- LAMMPS 测试 ----------
       - name: "Run LAMMPS tests (shard ${{ matrix.shard }})"
+        working-directory: ${{ steps.find_build.outputs.path }}
         run: |
           python -m pytest --timeout=300 --cov=deepmd source/lmp/tests \
             --splits 12 --group ${{ matrix.shard }} \
             --splitting-algorithm least_duration \
             --store-durations --clean-durations \
-            --durations-path=.test_durations_lmp_${{ matrix.backend_id }}
+            --durations-path=../.test_durations_lmp_${{ matrix.backend_id }}
         env:
           OMP_NUM_THREADS: 1
           TF_INTRA_OP_PARALLELISM_THREADS: 1
           TF_INTER_OP_PARALLELISM_THREADS: 1
-          LAMMPS_PLUGIN_PATH: ${{ github.workspace }}/dp_test/lib/deepmd_lmp
+          LAMMPS_PLUGIN_PATH: ${{ github.workspace }}/downloaded_artifact/dp_test/lib/deepmd_lmp
           ENABLE_TENSORFLOW: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PYTORCH: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.backend_id == 'paddle' && '1' || '0' }}
       # ---------- iPI 测试 ----------
       - name: "Run iPI tests (shard ${{ matrix.shard }})"
+        working-directory: ${{ steps.find_build.outputs.path }}
         run: |
           python -m pytest --timeout=300 --cov=deepmd source/ipi/tests \
             --splits 12 --group ${{ matrix.shard }} \
             --splitting-algorithm least_duration \
             --store-durations --clean-durations \
-            --durations-path=.test_durations_ipi_${{ matrix.backend_id }}
+            --durations-path=../.test_durations_ipi_${{ matrix.backend_id }}
         env:
           OMP_NUM_THREADS: 1
           TF_INTRA_OP_PARALLELISM_THREADS: 1
           TF_INTER_OP_PARALLELISM_THREADS: 1
-          LD_LIBRARY_PATH: ${{ github.workspace }}/dp_test/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/downloaded_artifact/dp_test/lib
           ENABLE_TENSORFLOW: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PYTORCH: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
