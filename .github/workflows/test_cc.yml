@@ -10,11 +10,11 @@ permissions:
 
 jobs:
   # ============================================================
-  # 1. 构建 C++ (分离构建与测试)
+  # 1. 构建 C++ (只编译，不测试)
   # ============================================================
   build:
-    name: "Build C++ (true, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
-    runs-on: ubuntu-slim
+    name: "Build C++ (${{ matrix.check_memleak }}, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
+    runs-on: ${{ (matrix.check_memleak == false && github.repository_owner == 'deepmodeling') && 'cpu' || 'ubuntu-22.04' }}
     strategy:
       fail-fast: false
       matrix:
@@ -23,7 +23,7 @@ jobs:
             enable_tensorflow: true
             enable_pytorch: true
             enable_paddle: false
-          - check_memleak: false
+          - check_memleak: true
             enable_tensorflow: false
             enable_pytorch: false
             enable_paddle: true
@@ -38,11 +38,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: "Install GCC"
-        if: matrix.check_memleak == true
-        run: sudo apt-get update && sudo apt-get install -y gcc-10 g++-10
-      - name: "Fix kernel mmap rnd bits"
-        if: ${{ matrix.check_memleak }}
-        run: sudo sysctl vm.mmap_rnd_bits=28
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential
+        if: ${{ matrix.check_memleak == false && github.repository_owner == 'deepmodeling' }}
       - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
@@ -59,6 +58,9 @@ jobs:
           DP_ENABLE_PYTORCH: 1
       - name: "Convert models"
         run: source/tests/infer/convert-models.sh
+      - name: "Fix kernel mmap rnd bits"
+        run: sudo sysctl vm.mmap_rnd_bits=28
+        if: ${{ matrix.check_memleak }}
       - name: "Compile C++ library and unit test binaries"
         run: source/install/test_cc_local.sh
         env:
@@ -71,7 +73,7 @@ jobs:
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && 'TRUE' || 'FALSE' }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch && 'TRUE' || 'FALSE' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && 'TRUE' || 'FALSE' }}
-      # 收集单元测试时长
+      # 收集单元测试时长（用于后续分片）
       - name: "Collect unit test durations"
         working-directory: ${{ github.workspace }}/build_tests
         continue-on-error: true
@@ -99,91 +101,21 @@ jobs:
             build_tests/
             .test_durations_unit.json
           include-hidden-files: true
-      # 上传单元测试 durations
-      - uses: actions/upload-artifact@v7
-        with:
-          name: durations-unit-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_paddle }}
-          path: .test_durations_unit.json
-          include-hidden-files: true
-        if: ${{ !matrix.check_memleak }}
 
   # ============================================================
-  # 2. 单元测试（GoogleTest）分片 job
+  # 2. 合并所有测试（单元测试 + LAMMPS + iPI）分片运行
   # ============================================================
-  test_unit:
-    name: "Unit Tests (Shard ${{ matrix.group }}, Backend: ${{ matrix.backend_id }})"
-    needs: build
-    runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        group: [1,2,3,4,5,6,7,8,9,10,11,12]
-        backend_id: ["tf_torch", "paddle"]
-    steps:
-      - uses: actions/checkout@v4
-      - name: "Determine artifact name"
-        id: artifact
-        run: |
-          if [ "${{ matrix.backend_id }}" = "tf_torch" ]; then
-            echo "name=build-false-true-true-false" >> $GITHUB_OUTPUT
-          else
-            echo "name=build-false-false-false-true" >> $GITHUB_OUTPUT
-          fi
-      - uses: actions/download-artifact@v8
-        with:
-          name: ${{ steps.artifact.outputs.name }}
-      - name: "List files after download (Debug)"
-        run: |
-          pwd
-          ls -la
-          find . -maxdepth 3 -type d -name "*build*"
-      - name: "Run unit tests (shard ${{ matrix.group }})"
-        run: |
-          # 自适应查找构建目录
-          if [ -d "build_tests" ]; then
-            cd build_tests
-          elif [ -d "dp_test" ]; then
-            cd dp_test
-          else
-            echo "Error: Neither build_tests nor dp_test directory found!"
-            exit 1
-          fi
-          total_shards=12
-          shard_index=$(( matrix.group - 1 ))
-          ctest -j4 --test-dir . -I ${shard_index},,${total_shards} --output-on-failure
-        env:
-          OMP_NUM_THREADS: 1
-          LD_LIBRARY_PATH: ${{ github.workspace }}/dp_test/lib
-
-  # ============================================================
-  # 3. LAMMPS 集成测试分片 job（含重试机制）
-  # ============================================================
-  test_lammps:
-    name: "LAMMPS Tests (Shard ${{ matrix.group }}, Backend: ${{ matrix.backend_id }})"
+  test_all:
+    name: "All Tests (Shard ${{ matrix.shard }}, Backend: ${{ matrix.backend_id }})"
     needs: build
     runs-on: ${{ (matrix.backend_id == 'tf_torch' && github.repository_owner == 'deepmodeling') && 'cpu' || 'ubuntu-22.04' }}
     strategy:
       fail-fast: false
       matrix:
-        group: [1,2,3,4,5,6,7,8,9,10,11,12]
+        shard: [1,2,3,4,5,6,7,8,9,10,11,12]
         backend_id: ["tf_torch", "paddle"]
     steps:
-      - uses: actions/checkout@v4 # 拉取源码（包含脚本）
-      - name: "Set up Python"
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-          cache: "pip"
-      - name: "Install Python dependencies"
-        run: |
-          python -m pip install --upgrade pip
-          pip install uv
-          uv pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu --torch-backend cpu
-          uv pip install --system -e .[cpu,test,lmp,jax,torch] mpi4py mpich pytest pytest-cov
-        env:
-          DP_ENABLE_PYTORCH: 1
-      - name: "Make scripts executable"
-        run: chmod +x source/install/*.sh || true
+      - uses: actions/checkout@v4  # 拉取源码（包含测试脚本）
       - name: "Determine artifact name"
         id: artifact
         run: |
@@ -195,10 +127,26 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: ${{ steps.artifact.outputs.name }}
-      - name: "Run LAMMPS tests (shard ${{ matrix.group }})"
+      - name: "List downloaded files (Debug)"
         run: |
-          source/install/retry_on_sigterm.sh 3 python -m pytest --timeout=300 --cov=deepmd source/lmp/tests \
-            --splits 12 --group ${{ matrix.group }} \
+          pwd
+          ls -la
+          find . -maxdepth 3 -type d
+      # ---------- 单元测试 ----------
+      - name: "Run unit tests (shard ${{ matrix.shard }})"
+        run: |
+          cd build_tests
+          total_shards=12
+          shard_index=$(( matrix.shard - 1 ))
+          ctest -j4 --test-dir . -I ${shard_index},,${total_shards} --output-on-failure
+        env:
+          OMP_NUM_THREADS: 1
+          LD_LIBRARY_PATH: ${{ github.workspace }}/dp_test/lib
+      # ---------- LAMMPS 测试 ----------
+      - name: "Run LAMMPS tests (shard ${{ matrix.shard }})"
+        run: |
+          python -m pytest --timeout=300 --cov=deepmd source/lmp/tests \
+            --splits 12 --group ${{ matrix.shard }} \
             --splitting-algorithm least_duration \
             --store-durations --clean-durations \
             --durations-path=.test_durations_lmp_${{ matrix.backend_id }}
@@ -211,63 +159,11 @@ jobs:
           ENABLE_PYTORCH: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.backend_id == 'paddle' && '1' || '0' }}
-      - name: "Upload LAMMPS durations"
-        uses: actions/upload-artifact@v7
-        with:
-          name: durations-lmp-${{ matrix.backend_id }}-${{ matrix.group }}
-          path: .test_durations_lmp_${{ matrix.backend_id }}
-          include-hidden-files: true
-      - name: "Upload coverage to Codecov (LAMMPS)"
-        uses: codecov/codecov-action@v7
-        continue-on-error: true
-        with:
-          use_oidc: true
-          flags: lammps,${{ matrix.backend_id }},shard${{ matrix.group }}
-
-  # ============================================================
-  # 4. iPI 集成测试分片 job
-  # ============================================================
-  test_ipi:
-    name: "iPI Tests (Shard ${{ matrix.group }}, Backend: ${{ matrix.backend_id }})"
-    needs: build
-    runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        group: [1,2,3,4,5,6,7,8,9,10,11,12]
-        backend_id: ["tf_torch", "paddle"]
-    steps:
-      - uses: actions/checkout@v4 # 拉取源码（包含脚本）
-      - name: "Set up Python"
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-          cache: "pip"
-      - name: "Install Python dependencies"
+      # ---------- iPI 测试 ----------
+      - name: "Run iPI tests (shard ${{ matrix.shard }})"
         run: |
-          python -m pip install --upgrade pip
-          pip install uv
-          uv pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu --torch-backend cpu
-          uv pip install --system -e .[cpu,test,ipi,jax,torch] mpi4py mpich pytest pytest-cov
-        env:
-          DP_ENABLE_PYTORCH: 1
-      - name: "Make scripts executable"
-        run: chmod +x source/install/*.sh || true
-      - name: "Determine artifact name"
-        id: artifact
-        run: |
-          if [ "${{ matrix.backend_id }}" = "tf_torch" ]; then
-            echo "name=build-false-true-true-false" >> $GITHUB_OUTPUT
-          else
-            echo "name=build-false-false-false-true" >> $GITHUB_OUTPUT
-          fi
-      - uses: actions/download-artifact@v8
-        with:
-          name: ${{ steps.artifact.outputs.name }}
-      - name: "Run iPI tests (shard ${{ matrix.group }})"
-        run: |
-          source/install/retry_on_sigterm.sh 3 python -m pytest --timeout=300 --cov=deepmd source/ipi/tests \
-            --splits 12 --group ${{ matrix.group }} \
+          python -m pytest --timeout=300 --cov=deepmd source/ipi/tests \
+            --splits 12 --group ${{ matrix.shard }} \
             --splitting-algorithm least_duration \
             --store-durations --clean-durations \
             --durations-path=.test_durations_ipi_${{ matrix.backend_id }}
@@ -280,26 +176,28 @@ jobs:
           ENABLE_PYTORCH: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.backend_id == 'paddle' && '1' || '0' }}
-      - name: "Upload iPI durations"
+      - name: "Upload durations"
         uses: actions/upload-artifact@v7
         with:
-          name: durations-ipi-${{ matrix.backend_id }}-${{ matrix.group }}
-          path: .test_durations_ipi_${{ matrix.backend_id }}
+          name: durations-${{ matrix.backend_id }}-${{ matrix.shard }}
+          path: |
+            .test_durations_lmp_${{ matrix.backend_id }}
+            .test_durations_ipi_${{ matrix.backend_id }}
           include-hidden-files: true
-      - name: "Upload coverage to Codecov (iPI)"
+      - name: "Upload coverage to Codecov"
         uses: codecov/codecov-action@v7
         continue-on-error: true
         with:
           use_oidc: true
-          flags: ipi,${{ matrix.backend_id }},shard${{ matrix.group }}
+          flags: all,${{ matrix.backend_id }},shard${{ matrix.shard }}
 
   # ============================================================
-  # 5. 合并 durations
+  # 3. 合并 durations
   # ============================================================
   update_durations:
-    name: "Combine C++ test durations"
+    name: "Combine durations"
     runs-on: ubuntu-slim
-    needs: [test_lammps, test_ipi]
+    needs: [test_all]
     if: always()
     steps:
       - uses: actions/download-artifact@v8
@@ -324,11 +222,11 @@ jobs:
           restore-keys: testcc-durations-
 
   # ============================================================
-  # 6. 汇总 pass job
+  # 4. 汇总 pass
   # ============================================================
   pass:
     name: "Pass testing C++"
-    needs: [build, test_unit, test_lammps, test_ipi, update_durations]
+    needs: [build, test_all, update_durations]
     if: always()
     runs-on: ubuntu-slim
     steps:
