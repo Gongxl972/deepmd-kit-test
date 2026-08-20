@@ -2,9 +2,13 @@ name: Test C++
 
 on:
   push:
-    branches: [master, v*]
+    branches-ignore:
+      - "gh-readonly-queue/**"
+      - "copilot/**"
+      - "dependabot/**"
+      - "pre-commit-ci-update-config"
   pull_request:
-    branches: [master, v*]
+  merge_group:
 
 jobs:
   # ============================================================
