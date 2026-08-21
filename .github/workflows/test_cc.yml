@@ -10,6 +10,13 @@ on:
   pull_request:
   merge_group:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+
 jobs:
   # ============================================================
   # 1. 构建 C++（4 个后端组合）
@@ -77,7 +84,7 @@ jobs:
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && 'TRUE' || 'FALSE' }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch && 'TRUE' || 'FALSE' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && 'TRUE' || 'FALSE' }}
-      # 收集单元测试时长
+      # 收集单元测试时长（注意路径：build_tests 在 source/ 下）
       - name: "Collect unit test durations"
         working-directory: ${{ github.workspace }}/source/build_tests
         continue-on-error: true
@@ -86,7 +93,7 @@ jobs:
             echo "No CTest configuration found, skipping duration collection."
             exit 0
           fi
-          ctest --output-json=../.test_durations_unit.json --force-new-ctest-process
+          ctest --output-json=../../.test_durations_unit.json --force-new-ctest-process
         if: ${{ !matrix.check_memleak }}
       # 拷贝 Paddle 库
       - name: "Copy Paddle libs"
@@ -96,7 +103,7 @@ jobs:
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/onednn/lib/* ${{ github.workspace }}/dp_test/lib/ || true
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/mklml/lib/* ${{ github.workspace }}/dp_test/lib/ || true
         if: ${{ matrix.enable_paddle }}
-      # 上传编译产物
+      # 上传编译产物（修正路径：包含 source/ 前缀）
       - uses: actions/upload-artifact@v7
         with:
           name: build-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_paddle }}
@@ -139,16 +146,14 @@ jobs:
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ./downloaded_artifact
-      
       - name: "Debug: List all downloaded files"
         run: |
           echo "Current directory: $(pwd)"
           ls -R ./downloaded_artifact
-
       - name: "Find build_tests directory"
         id: find_build
         run: |
-          # 精确在下载目录中查找，避免被 checkout 的空源码目录干扰
+          # 在下载目录中查找 source/build_tests
           BUILD_DIR=$(find ./downloaded_artifact -type d -name "build_tests" | head -n 1)
           if [ -z "$BUILD_DIR" ]; then
             echo "Error: build_tests directory not found in downloaded_artifact!"
@@ -158,13 +163,10 @@ jobs:
           fi
           echo "Found build_tests at: $BUILD_DIR"
           echo "path=$BUILD_DIR" >> $GITHUB_OUTPUT
-
       - name: "Install Python dependencies"
         run: |
           python -m pip install --upgrade pip
-          # 补充安装 pytest-split，否则 --splits 参数会报错
           pip install pytest pytest-timeout pytest-cov pytest-split
-
       - name: "Make scripts executable"
         run: chmod +x source/install/*.sh || true
 
@@ -172,23 +174,16 @@ jobs:
       - name: "Run unit tests (shard ${{ matrix.shard }})"
         working-directory: ${{ steps.find_build.outputs.path }}
         run: |
-          if [ ! -f "CTestTestfile.cmake" ]; then
-            echo "No CTests found, skipping."
-            exit 0
-          fi
-          # 修正 ctest 分片语法：使用 -I <start>,<end>,<stride>
-          START_INDEX=$(( ${{ matrix.shard }} - 1 ))
-          ctest -j4 --output-on-failure -I ${START_INDEX},,12
+          ctest -j4 --test-dir . -I $(( matrix.shard - 1 )),,12 --output-on-failure
         env:
           OMP_NUM_THREADS: 1
           LD_LIBRARY_PATH: ${{ github.workspace }}/downloaded_artifact/dp_test/lib
 
       # ---------- LAMMPS 测试 ----------
       - name: "Run LAMMPS tests (shard ${{ matrix.shard }})"
-        # 修正路径为 source/lammps/tests
         working-directory: ${{ github.workspace }}/source
         run: |
-          python -m pytest --timeout=300 --cov=deepmd lammps/tests \
+          python -m pytest --timeout=300 --cov=deepmd lmp/tests \
             --splits 12 --group ${{ matrix.shard }} \
             --splitting-algorithm least_duration \
             --store-durations --clean-durations \
@@ -198,7 +193,6 @@ jobs:
           TF_INTRA_OP_PARALLELISM_THREADS: 1
           TF_INTER_OP_PARALLELISM_THREADS: 1
           LAMMPS_PLUGIN_PATH: ${{ github.workspace }}/downloaded_artifact/dp_test/lib/deepmd_lmp
-          LD_LIBRARY_PATH: ${{ github.workspace }}/downloaded_artifact/dp_test/lib
           ENABLE_TENSORFLOW: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PYTORCH: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
