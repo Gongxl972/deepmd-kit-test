@@ -11,32 +11,16 @@ on:
   merge_group:
 
 jobs:
-  # ============================================================
-  # 1. 构建阶段（保留你之前成功的逻辑，修复 CMake 安装）
-  # ============================================================
   build:
-    name: "Build C++ (${{ matrix.enable_tensorflow }}, ${{ matrix.enable_pytorch }}, ${{ matrix.enable_jax }}, ${{ matrix.enable_paddle }})"
     runs-on: ubuntu-slim
     strategy:
       fail-fast: false
       matrix:
         include:
-          - enable_tensorflow: true
-            enable_pytorch: true
-            enable_jax: true
-            enable_paddle: false
-          - enable_tensorflow: true
-            enable_pytorch: false
-            enable_jax: false
-            enable_paddle: true
-          - enable_tensorflow: false
-            enable_pytorch: true
-            enable_jax: true
-            enable_paddle: false
-          - enable_tensorflow: false
-            enable_pytorch: false
-            enable_jax: false
-            enable_paddle: true
+          - { tf: true, torch: true, paddle: false }
+          - { tf: true, torch: false, paddle: true }
+          - { tf: false, torch: true, paddle: false }
+          - { tf: false, torch: false, paddle: true }
 
     steps:
       - uses: actions/checkout@v4
@@ -49,137 +33,85 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-split pytest-cov
+          pip install pytest pytest-timeout pytest-cov jq
 
-      # 修复：使用社区维护的 CMake 安装 action（官方 actions 无 setup-cmake）
       - name: Setup CMake
         uses: jwlawson/actions-setup-cmake@v1.13
         with:
-          cmake-version: '3.27.x'
+          cmake-version: '3.29.5'
+
+      # 【修复】安装缺失的 Ninja 和 C/C++ 编译器
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build build-essential
 
       - name: Create Build Directory
         working-directory: ${{ github.workspace }}/source
         run: cmake -E make_directory build_tests
 
       - name: Configure CMake
-        working-directory: ${{ github.workspace }}/source/build_tests
+        working-directory: ${{ github.workspace }}/source
         run: |
           cmake .. \
+            -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTING=ON \
-            -DENABLE_TENSORFLOW=${{ matrix.enable_tensorflow && 'ON' || 'OFF' }} \
-            -DENABLE_PYTORCH=${{ matrix.enable_pytorch && 'ON' || 'OFF' }} \
-            -DENABLE_JAX=${{ matrix.enable_jax && 'ON' || 'OFF' }} \
-            -DENABLE_PADDLE=${{ matrix.enable_paddle && 'ON' || 'OFF' }} \
-            -GNinja
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \
+            -DUSE_TF=${{ matrix.tf }} \
+            -DUSE_TORCH=${{ matrix.torch }} \
+            -DUSE_PADDLE=${{ matrix.paddle }}
+        env:
+          CC: gcc
+          CXX: g++
 
       - name: Compile C++ library and unit test binaries
-        working-directory: ${{ github.workspace }}/source/build_tests
-        run: cmake --build . --config Release --parallel $(nproc)
-
-      - name: Collect unit test durations
-        working-directory: ${{ github.workspace }}/source/build_tests
-        run: |
-          if [ ! -f "CTestTestfile.cmake" ]; then
-            echo "No CTestTestfile.cmake found, skipping duration collection"
-            exit 0
-          fi
-          # 使用兼容的 --show-only=json-v1 替代 --output-json
-          ctest --show-only=json-v1 > ../.test_durations_unit.json || true
-
-      - name: Copy Paddle libs
-        if: matrix.enable_paddle == true
-        working-directory: ${{ github.workspace }}/source/build_tests
-        run: |
-          mkdir -p ../downloaded_artifact/dp_test/lib
-          cp lib/*.so ../downloaded_artifact/dp_test/lib/ || true
+        working-directory: ${{ github.workspace }}/source
+        run: cmake --build build_tests --config Release
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
-          name: build-artifact-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_jax }}-${{ matrix.enable_paddle }}
-          path: |
-            ${{ github.workspace }}/source/build_tests
-            ${{ github.workspace }}/source/downloaded_artifact
-          include-hidden-files: true
-
-      - name: Upload durations
-        uses: actions/upload-artifact@v7
-        with:
-          name: durations-build-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_jax }}-${{ matrix.enable_paddle }}
-          path: ${{ github.workspace }}/source/.test_durations_unit.json
+          name: dp_test-${{ matrix.tf }}-${{ matrix.torch }}-${{ matrix.paddle }}
+          path: ${{ github.workspace }}/source/build_tests/
           if-no-files-found: ignore
 
-  # ============================================================
-  # 2. 测试阶段（修复 CTest 权限、路径、pytest 导入错误）
-  # ============================================================
   test_all:
-    name: "All Tests (Shard ${{ matrix.shard }}, Backend: ${{ matrix.backend_id }})"
+    needs: build
     runs-on: ubuntu-slim
-    needs: [build]
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         backend_id: [tf_torch, paddle]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Determine artifact name
-        id: determine-artifact
-        run: |
-          if [[ "${{ matrix.backend_id }}" == "tf_torch" ]]; then
-            echo "name=build-artifact-true-true-true-false" >> $GITHUB_OUTPUT
-          else
-            echo "name=build-artifact-true-false-false-true" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v8
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          name: ${{ steps.determine-artifact.outputs.name }}
-          path: ${{ github.workspace }}/downloaded_artifact
+          python-version: '3.10'
 
-      - name: Debug list files
-        run: ls -R ${{ github.workspace }}/downloaded_artifact
-
-      - name: Find build_tests directory
-        id: find-build
-        run: |
-          BUILD_DIR=$(find ${{ github.workspace }}/downloaded_artifact -type d -name "build_tests" | head -n 1)
-          echo "build_dir=$BUILD_DIR" >> $GITHUB_OUTPUT
-
-      - name: Install Python dependencies
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-split pytest-cov
+          pip install pytest pytest-timeout pytest-cov
 
-      # 修复1：给测试二进制文件添加执行权限，解决 permission denied
-      - name: Make scripts executable
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dp_test-${{ matrix.tf }}-${{ matrix.torch }}-${{ matrix.paddle }}
+          path: ${{ github.workspace }}/downloaded_artifact/dp_test
+
+      - name: Fix permissions and run CTests
+        working-directory: ${{ github.workspace }}/downloaded_artifact/dp_test
         run: |
-          chmod +x ${{ steps.find-build.outputs.build_dir }}/lib/tests/* || true
-          chmod +x ${{ steps.find-build.outputs.build_dir }}/api_tests/*/* || true
+          chmod +x $(find . -type f -executable)
+          ctest --output-on-failure -C Release
 
-      # 修复2：计算分片索引（避免 YAML 表达式语法错误）
-      - name: Compute shard index
-        id: compute_index
-        run: |
-          INDEX=$(( ${{ matrix.shard }} - 1 ))
-          echo "index=$INDEX" >> $GITHUB_OUTPUT
-
-      # 修复3：运行 CTest，设置正确的配置类型和路径
-      - name: Run unit tests (shard ${{ matrix.shard }})
-        working-directory: ${{ steps.find-build.outputs.build_dir }}
-        run: |
-          ctest -j4 --output-on-failure \
-            -I ${{ steps.compute_index.outputs.index }},,12 \
-            -C Release
-        env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/downloaded_artifact/dp_test/lib:${{ steps.find-build.outputs.build_dir }}/lib
-
-      # 修复4：pytest 添加 --continue-on-collection-errors
-      - name: Run LAMMPS tests (shard ${{ matrix.shard }})
+      - name: Run LAMMPS tests
         working-directory: ${{ github.workspace }}/source
         run: |
           python -m pytest --timeout=300 --cov=deepmd lmp/tests \
@@ -198,7 +130,7 @@ jobs:
           ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.backend_id == 'paddle' && '1' || '0' }}
 
-      - name: Run iPI tests (shard ${{ matrix.shard }})
+      - name: Run iPI tests
         working-directory: ${{ github.workspace }}/source
         run: |
           python -m pytest --timeout=300 --cov=deepmd ipi/tests \
@@ -233,9 +165,6 @@ jobs:
           use-oidc: true
           flags: all,${{ matrix.backend_id }},shard${{ matrix.shard }}
 
-  # ============================================================
-  # 3. 合并 durations
-  # ============================================================
   update_durations:
     name: "Combine durations"
     runs-on: ubuntu-slim
@@ -261,9 +190,6 @@ jobs:
           key: testcc-durations-${{ github.sha }}
           restore-keys: testcc-durations-
 
-  # ============================================================
-  # 4. 汇总 pass
-  # ============================================================
   pass:
     name: "Pass testing C++"
     needs: [build, test_all, update_durations]
