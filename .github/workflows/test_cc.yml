@@ -1,5 +1,13 @@
 name: Test C++
-on: [push]
+on:
+  push:
+    branches-ignore:
+      - "gh-readonly-queue/**"
+      - "copilot/**"
+      - "dependabot/**"
+      - "pre-commit-ci-update-config"
+  pull_request:
+  merge_group:
 
 env:
   BUILD_TYPE: Release
