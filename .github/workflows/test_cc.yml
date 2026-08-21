@@ -10,168 +10,185 @@ on:
   pull_request:
   merge_group:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+
 jobs:
   # ============================================================
-  # 1. 构建阶段（使用您之前成功的构建逻辑）
+  # 1. 构建阶段（完全复用您之前成功的配置）
   # ============================================================
   build:
-    name: "Build C++ (${{ matrix.enable_tensorflow }}, ${{ matrix.enable_pytorch }}, ${{ matrix.enable_paddle }})"
-    runs-on: ubuntu-slim
+    name: "Build C++ (${{ matrix.check_memleak }}, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
+    runs-on: ${{ (matrix.check_memleak == false && github.repository_owner == 'deepmodeling') && 'cpu' || 'ubuntu-22.04' }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - enable_tensorflow: true
+          - check_memleak: true
+            enable_tensorflow: true
             enable_pytorch: true
             enable_paddle: false
-          - enable_tensorflow: true
+          - check_memleak: true
+            enable_tensorflow: false
             enable_pytorch: false
             enable_paddle: true
-          - enable_tensorflow: false
+          - check_memleak: false
+            enable_tensorflow: true
             enable_pytorch: true
             enable_paddle: false
-          - enable_tensorflow: false
+          - check_memleak: false
+            enable_tensorflow: false
             enable_pytorch: false
             enable_paddle: true
-
+    outputs:
+      build_key: ${{ format('{0}-{1}-{2}-{3}', matrix.check_memleak, matrix.enable_tensorflow, matrix.enable_pytorch, matrix.enable_paddle) }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install Python deps
-        run: pip install pytest pytest-split pytest-cov
-
-      - name: Setup CMake
-        uses: jwlawson/actions-setup-cmake@v1.15
-        with:
-          cmake-version: '3.30.x'
-
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y ninja-build build-essential
-
-      - name: Create Build Directory
-        working-directory: ${{ github.workspace }}/source
-        run: mkdir -p build_tests
-
-      - name: Configure CMake
-        working-directory: ${{ github.workspace }}/source
+      - name: "Install GCC"
         run: |
-          cmake -S . -B build_tests \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=gcc \
-            -DCMAKE_CXX_COMPILER=g++ \
-            -DENABLE_TENSORFLOW=${{ matrix.enable_tensorflow && 'ON' || 'OFF' }} \
-            -DENABLE_PYTORCH=${{ matrix.enable_pytorch && 'ON' || 'OFF' }} \
-            -DENABLE_PADDLE=${{ matrix.enable_paddle && 'ON' || 'OFF' }}
-
-      - name: Compile C++ library and unit test binaries
-        working-directory: ${{ github.workspace }}/source
-        run: cmake --build build_tests --config Release --parallel $(nproc)
-
-      - name: Collect unit test durations
+          sudo apt-get update
+          sudo apt-get install --yes build-essential
+        if: ${{ matrix.check_memleak == false && github.repository_owner == 'deepmodeling' }}
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - uses: lukka/get-cmake@latest
+      - run: python -m pip install uv
+      - name: "Install Python dependencies"
+        run: |
+          source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu --torch-backend cpu
+          export TENSORFLOW_ROOT=$(python -c 'import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec("tensorflow").origin).parent)')
+          export PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')
+          source/install/uv_with_retry.sh pip install --system -e .[cpu,test,lmp,jax,torch] mpi4py mpich
+        env:
+          DP_ENABLE_PYTORCH: 1
+      - name: "Convert models"
+        run: source/tests/infer/convert-models.sh
+      - name: "Fix kernel mmap rnd bits"
+        run: sudo sysctl vm.mmap_rnd_bits=28
+        if: ${{ matrix.check_memleak }}
+      - name: "Compile C++ library and unit test binaries"
+        run: source/install/test_cc_local.sh
+        env:
+          OMP_NUM_THREADS: 1
+          TF_INTRA_OP_PARALLELISM_THREADS: 1
+          TF_INTER_OP_PARALLELISM_THREADS: 1
+          CMAKE_GENERATOR: Ninja
+          CXXFLAGS: ${{ matrix.check_memleak && '-fsanitize=leak' || '' }}
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/workflows/suppr.txt
+          ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && 'TRUE' || 'FALSE' }}
+          ENABLE_PYTORCH: ${{ matrix.enable_pytorch && 'TRUE' || 'FALSE' }}
+          ENABLE_PADDLE: ${{ matrix.enable_paddle && 'TRUE' || 'FALSE' }}
+      # 收集单元测试时长
+      - name: "Collect unit test durations"
         working-directory: ${{ github.workspace }}/source/build_tests
+        continue-on-error: true
         run: |
-          if [ -f "CTestTestfile.cmake" ]; then
-            ctest --show-only=json-v1 > ../.test_durations_unit.json || true
+          if [ ! -f "CTestTestfile.cmake" ]; then
+            echo "No CTest configuration found, skipping duration collection."
+            exit 0
           fi
-
-      - name: Copy Paddle libs
-        if: matrix.enable_paddle == true
+          ctest --show-only=json-v1 > ../.test_durations_unit.json
+        if: ${{ !matrix.check_memleak }}
+      # 拷贝 Paddle 库
+      - name: "Copy Paddle libs"
         run: |
-          mkdir -p ${{ github.workspace }}/downloaded_artifact/dp_test/lib
-          cp ${{ github.workspace }}/source/build_tests/lib/*.so ${{ github.workspace }}/downloaded_artifact/dp_test/lib/ || true
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
+          mkdir -p dp_test/lib
+          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/paddle/lib/*.so ${{ github.workspace }}/dp_test/lib/ || true
+          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/onednn/lib/* ${{ github.workspace }}/dp_test/lib/ || true
+          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/mklml/lib/* ${{ github.workspace }}/dp_test/lib/ || true
+        if: ${{ matrix.enable_paddle }}
+      # 上传编译产物
+      - uses: actions/upload-artifact@v7
         with:
-          name: build-artifact-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_paddle }}
+          name: build-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_paddle }}
           path: |
-            ${{ github.workspace }}/source/build_tests
-            ${{ github.workspace }}/source/downloaded_artifact
+            dp_test/
+            source/build_tests/
+          include-hidden-files: true
+      # 上传单元测试 durations
+      - name: "Upload durations"
+        uses: actions/upload-artifact@v7
+        if: ${{ !matrix.check_memleak }}
+        continue-on-error: true
+        with:
+          name: durations-unit-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_paddle }}
+          path: .test_durations_unit.json
+          if-no-files-found: ignore
           include-hidden-files: true
 
-      - name: Upload durations
-        uses: actions/upload-artifact@v7
-        with:
-          name: durations-build-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_paddle }}
-          path: ${{ github.workspace }}/source/.test_durations_unit.json
-          if-no-files-found: ignore
-
   # ============================================================
-  # 2. 测试阶段（修复 CTest 权限、路径、pytest 收集错误）
+  # 2. 测试阶段（仅修复 CTest 权限、路径、pytest 收集错误）
   # ============================================================
   test_all:
     name: "All Tests (Shard ${{ matrix.shard }}, Backend: ${{ matrix.backend_id }})"
-    runs-on: ubuntu-slim
-    needs: [build]
+    needs: build
+    runs-on: ${{ (matrix.backend_id == 'tf_torch' && github.repository_owner == 'deepmodeling') && 'cpu' || 'ubuntu-22.04' }}
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        backend_id: [tf_torch, paddle]
-
+        shard: [1,2,3,4,5,6,7,8,9,10,11,12]
+        backend_id: ["tf_torch", "paddle"]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Determine artifact name
-        id: artifact-name
+      - name: "Determine artifact name"
+        id: artifact
         run: |
           if [ "${{ matrix.backend_id }}" = "tf_torch" ]; then
-            echo "name=build-artifact-true-true-false" >> $GITHUB_OUTPUT
+            echo "name=build-false-true-true-false" >> $GITHUB_OUTPUT
           else
-            echo "name=build-artifact-true-false-true" >> $GITHUB_OUTPUT
+            echo "name=build-false-false-false-true" >> $GITHUB_OUTPUT
           fi
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8
         with:
-          name: ${{ steps.artifact-name.outputs.name }}
-          path: ${{ github.workspace }}/downloaded_artifact
-
-      - name: Debug list files
-        run: ls -R ${{ github.workspace }}/downloaded_artifact
-
-      - name: Find build_tests directory
-        id: find-build
+          name: ${{ steps.artifact.outputs.name }}
+          path: ./downloaded_artifact
+      - name: "Debug: List all downloaded files"
         run: |
-          BUILD_DIR=$(find ${{ github.workspace }}/downloaded_artifact -type d -name "build_tests" | head -n 1)
-          echo "build_dir=$BUILD_DIR" >> $GITHUB_OUTPUT
-
-      - name: Install Python dependencies
+          echo "Current directory: $(pwd)"
+          ls -R ./downloaded_artifact
+      - name: "Find build_tests directory"
+        id: find_build
+        run: |
+          BUILD_DIR=$(find ./downloaded_artifact -type d -name "build_tests" | head -n 1)
+          if [ -z "$BUILD_DIR" ]; then
+            echo "Error: build_tests directory not found!"
+            echo "Searching for test executables..."
+            find . -type f -executable -name "*test*" || true
+            exit 1
+          fi
+          echo "Found build_tests at: $BUILD_DIR"
+          echo "path=$BUILD_DIR" >> $GITHUB_OUTPUT
+      - name: "Install Python dependencies"
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-split pytest-cov
+          pip install pytest pytest-timeout pytest-cov pytest-split
+      - name: "Make scripts executable"
+        run: chmod +x source/install/*.sh || true
 
-      # 修复1：给测试二进制文件添加执行权限
-      - name: Make scripts executable
+      # ---------- 单元测试（修复权限和路径）----------
+      - name: "Fix permissions for test binaries"
         run: |
-          chmod +x ${{ steps.find-build.outputs.build_dir }}/lib/tests/* || true
-          chmod +x ${{ steps.find-build.outputs.build_dir }}/api_tests/*/* || true
-
-      # 修复2：计算分片索引（避免 YAML 表达式语法错误）
-      - name: Compute shard index
-        id: compute-index
+          chmod +x ${{ steps.find_build.outputs.path }}/lib/tests/* || true
+          chmod +x ${{ steps.find_build.outputs.path }}/api_c/tests/* || true
+      - name: "Compute shard index"
+        id: compute_index
+        run: echo "index=$(( ${{ matrix.shard }} - 1 ))" >> $GITHUB_OUTPUT
+      - name: "Run unit tests (shard ${{ matrix.shard }})"
+        working-directory: ${{ steps.find_build.outputs.path }}
         run: |
-          INDEX=$(( ${{ matrix.shard }} - 1 ))
-          echo "index=$INDEX" >> $GITHUB_OUTPUT
-
-      # 修复3：运行 CTest，设置正确的配置类型和路径
-      - name: Run unit tests (shard ${{ matrix.shard }})
-        working-directory: ${{ steps.find-build.outputs.build_dir }}
-        run: |
-          ctest -j4 --output-on-failure \
-            -I ${{ steps.compute-index.outputs.index }},,12 \
-            -C Release
+          ctest -j4 --test-dir . -I ${{ steps.compute_index.outputs.index }},,12 --output-on-failure -C Release
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/downloaded_artifact/dp_test/lib:${{ steps.find-build.outputs.build_dir }}/lib
+          OMP_NUM_THREADS: 1
+          LD_LIBRARY_PATH: ${{ github.workspace }}/downloaded_artifact/dp_test/lib
 
-      # 修复4：pytest 添加 --continue-on-collection-errors
-      - name: Run LAMMPS tests (shard ${{ matrix.shard }})
+      # ---------- LAMMPS 测试（修复 pytest 收集错误）----------
+      - name: "Run LAMMPS tests (shard ${{ matrix.shard }})"
         working-directory: ${{ github.workspace }}/source
         run: |
           python -m pytest --timeout=300 --cov=deepmd lmp/tests \
@@ -190,7 +207,8 @@ jobs:
           ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.backend_id == 'paddle' && '1' || '0' }}
 
-      - name: Run iPI tests (shard ${{ matrix.shard }})
+      # ---------- iPI 测试（修复 pytest 收集错误）----------
+      - name: "Run iPI tests (shard ${{ matrix.shard }})"
         working-directory: ${{ github.workspace }}/source
         run: |
           python -m pytest --timeout=300 --cov=deepmd ipi/tests \
@@ -209,7 +227,7 @@ jobs:
           ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.backend_id == 'paddle' && '1' || '0' }}
 
-      - name: Upload durations
+      - name: "Upload durations"
         uses: actions/upload-artifact@v7
         with:
           name: durations-${{ matrix.backend_id }}-${{ matrix.shard }}
@@ -218,11 +236,11 @@ jobs:
             .test_durations_ipi_${{ matrix.backend_id }}
           include-hidden-files: true
 
-      - name: Upload coverage to Codecov
+      - name: "Upload coverage to Codecov"
         uses: codecov/codecov-action@v7
         continue-on-error: true
         with:
-          use-oidc: true
+          use_oidc: true
           flags: all,${{ matrix.backend_id }},shard${{ matrix.shard }}
 
   # ============================================================
@@ -238,13 +256,13 @@ jobs:
         with:
           pattern: durations-*
           merge-multiple: true
-      - name: Merge durations
+      - name: "Merge durations"
         run: |
           for backend in tf_torch paddle; do
             jq -s 'reduce .[] as $d ({}; . * $d)' .test_durations_lmp_${backend}_* > .test_durations_lmp_${backend}
             jq -s 'reduce .[] as $d ({}; . * $d)' .test_durations_ipi_${backend}_* > .test_durations_ipi_${backend}
           done
-      - name: Cache combined durations
+      - name: "Cache combined durations"
         uses: actions/cache@v6
         with:
           path: |
