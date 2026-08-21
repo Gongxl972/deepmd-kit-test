@@ -1,5 +1,4 @@
 name: Test C++
-
 on:
   push:
     branches-ignore:
@@ -12,18 +11,16 @@ on:
 
 jobs:
   build:
+    name: Build C++ ($matrix.config)
     runs-on: ubuntu-slim
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { tf: true, torch: true, paddle: false }
-          - { tf: true, torch: false, paddle: true }
-          - { tf: false, torch: true, paddle: false }
-          - { tf: false, torch: false, paddle: true }
-
+        config: [true, true, true, false, true, false, false, true, false, true, false, false, false, false, true]
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,63 +28,68 @@ jobs:
           python-version: '3.10'
 
       - name: Install Python deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest pytest-timeout pytest-cov jq
+        run: pip install pytest pytest-split pytest-timeout coverage
 
       - name: Setup CMake
         uses: jwlawson/actions-setup-cmake@v1.13
         with:
           cmake-version: '3.29.5'
 
-      # 【修复】安装缺失的 Ninja 和 C/C++ 编译器
       - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build build-essential
+        run: sudo apt-get update && sudo apt-get install -y g++ gcc ninja-build
 
       - name: Create Build Directory
         working-directory: ${{ github.workspace }}/source
-        run: cmake -E make_directory build_tests
+        run: mkdir -p build_tests
 
       - name: Configure CMake
         working-directory: ${{ github.workspace }}/source
-        run: |
-          cmake .. \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=gcc \
-            -DCMAKE_CXX_COMPILER=g++ \
-            -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \
-            -DUSE_TF=${{ matrix.tf }} \
-            -DUSE_TORCH=${{ matrix.torch }} \
-            -DUSE_PADDLE=${{ matrix.paddle }}
-        env:
-          CC: gcc
-          CXX: g++
+        run: cmake -S . -B build_tests -G "Ninja" -DCMAKE_BUILD_TYPE=Release
 
       - name: Compile C++ library and unit test binaries
         working-directory: ${{ github.workspace }}/source
         run: cmake --build build_tests --config Release
 
+      - name: Collect unit test durations
+        working-directory: ${{ github.workspace }}/source/build_tests
+        run: ctest --show-only=json-v1 > test_durations.json || true
+
+      - name: Copy Paddle libs
+        run: |
+          mkdir -p ${{ github.workspace }}/downloaded_artifact/dp_test/lib
+          cp ${{ github.workspace }}/source/build_tests/*.so ${{ github.workspace }}/downloaded_artifact/dp_test/lib/ || true
+
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: dp_test-${{ matrix.tf }}-${{ matrix.torch }}-${{ matrix.paddle }}
-          path: ${{ github.workspace }}/source/build_tests/
+          name: build-artifact-${{ matrix.config }}
+          path: ${{ github.workspace }}/downloaded_artifact
           if-no-files-found: ignore
 
   test_all:
+    name: All Tests (Shard ${{ matrix.shard }}, Backend: ${{ matrix.backend_id }})
     needs: build
     runs-on: ubuntu-slim
     strategy:
       fail-fast: false
       matrix:
-        backend_id: [tf_torch, paddle]
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-
+        backend_id: [tf_torch, paddle]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: build-artifact-${{ matrix.config }}
+          path: ${{ github.workspace }}/downloaded_artifact
+
+      - name: Fix permissions for test binaries
+        run: chmod +x ${{ github.workspace }}/downloaded_artifact/dp_test/lib/*
+
+      - name: Run CTests
+        working-directory: ${{ github.workspace }}/downloaded_artifact/dp_test
+        run: ctest -C Release
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -95,21 +97,10 @@ jobs:
           python-version: '3.10'
 
       - name: Install Python deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest pytest-timeout pytest-cov
+        run: pip install pytest pytest-split pytest-timeout coverage
 
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: dp_test-${{ matrix.tf }}-${{ matrix.torch }}-${{ matrix.paddle }}
-          path: ${{ github.workspace }}/downloaded_artifact/dp_test
-
-      - name: Fix permissions and run CTests
-        working-directory: ${{ github.workspace }}/downloaded_artifact/dp_test
-        run: |
-          chmod +x $(find . -type f -executable)
-          ctest --output-on-failure -C Release
+      - name: Install package editable
+        run: pip install -e .
 
       - name: Run LAMMPS tests
         working-directory: ${{ github.workspace }}/source
