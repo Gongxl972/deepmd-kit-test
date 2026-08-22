@@ -1,58 +1,34 @@
-name: Test C++
+name: Test CC
 
 on:
   push:
-    branches-ignore:
-      - "gh-readonly-queue/**"
-      - "copilot/**"
-      - "dependabot/**"
-      - "pre-commit-ci-update-config"
+    branches: [main, master]
   pull_request:
-  merge_group:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
-  cancel-in-progress: true
-
-permissions:
-  id-token: write
+    branches: [main, master]
 
 jobs:
   # ============================================================
-  # 1. 构建阶段（完全复用您之前成功的配置）
+  # 1. 构建阶段（保持原样）
   # ============================================================
   build:
     name: "Build C++ (${{ matrix.check_memleak }}, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
-    runs-on: ${{ (matrix.check_memleak == false && github.repository_owner == 'deepmodeling') && 'cpu' || 'ubuntu-22.04' }}
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - check_memleak: true
-            enable_tensorflow: true
-            enable_pytorch: true
-            enable_paddle: false
+        check_memleak: [true, false]
+        enable_tensorflow: [true, false]
+        enable_pytorch: [true, false]
+        enable_paddle: [true, false]
+        exclude:
           - check_memleak: true
             enable_tensorflow: false
+          - check_memleak: true
             enable_pytorch: false
-            enable_paddle: true
-          - check_memleak: false
-            enable_tensorflow: true
-            enable_pytorch: true
+          - check_memleak: true
             enable_paddle: false
-          - check_memleak: false
-            enable_tensorflow: false
-            enable_pytorch: false
-            enable_paddle: true
-    outputs:
-      build_key: ${{ format('{0}-{1}-{2}-{3}', matrix.check_memleak, matrix.enable_tensorflow, matrix.enable_pytorch, matrix.enable_paddle) }}
     steps:
       - uses: actions/checkout@v4
-      - name: "Install GCC"
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes build-essential
-        if: ${{ matrix.check_memleak == false && github.repository_owner == 'deepmodeling' }}
       - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
@@ -84,7 +60,6 @@ jobs:
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && 'TRUE' || 'FALSE' }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch && 'TRUE' || 'FALSE' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && 'TRUE' || 'FALSE' }}
-      # 收集单元测试时长
       - name: "Collect unit test durations"
         working-directory: ${{ github.workspace }}/source/build_tests
         continue-on-error: true
@@ -95,7 +70,6 @@ jobs:
           fi
           ctest --show-only=json-v1 > ../.test_durations_unit.json
         if: ${{ !matrix.check_memleak }}
-      # 拷贝 Paddle 库
       - name: "Copy Paddle libs"
         run: |
           mkdir -p dp_test/lib
@@ -103,7 +77,6 @@ jobs:
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/onednn/lib/* ${{ github.workspace }}/dp_test/lib/ || true
           cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/mklml/lib/* ${{ github.workspace }}/dp_test/lib/ || true
         if: ${{ matrix.enable_paddle }}
-      # 上传编译产物
       - uses: actions/upload-artifact@v7
         with:
           name: build-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_paddle }}
@@ -111,7 +84,6 @@ jobs:
             dp_test/
             source/build_tests/
           include-hidden-files: true
-      # 上传单元测试 durations
       - name: "Upload durations"
         uses: actions/upload-artifact@v7
         if: ${{ !matrix.check_memleak }}
@@ -123,7 +95,7 @@ jobs:
           include-hidden-files: true
 
   # ============================================================
-  # 2. 测试阶段（修复库缺失 + 性能优化）
+  # 2. 测试阶段
   # ============================================================
   test_all:
     name: "All Tests (Shard ${{ matrix.shard }}, Backend: ${{ matrix.backend_id }})"
@@ -136,34 +108,19 @@ jobs:
         backend_id: ["tf_torch", "paddle"]
     steps:
       - uses: actions/checkout@v4
-
-      # ---------- 系统依赖（带缓存）----------
+      
       - name: "Cache APT packages"
         uses: actions/cache@v6
         with:
           path: /var/cache/apt/archives
-          key: ${{ runner.os }}-apt-gtest-${{ hashFiles('.github/workflows/test_cc.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-apt-gtest-
+          key: apt-cache-${{ runner.os }}-libgtest
+          restore-keys: apt-cache-${{ runner.os }}-
+
       - name: "Install system dependencies"
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtest-dev cmake
 
-      # ---------- Python 环境（CPU 版本）----------
-      - name: "Set up Python"
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-          cache: "pip"
-      - name: "Install Python dependencies (CPU only)"
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest pytest-timeout pytest-cov pytest-split
-          # 强制安装 CPU 版本，避免拉取 CUDA 依赖
-          pip install tensorflow torch --index-url https://download.pytorch.org/whl/cpu
-
-      # ---------- 下载构建产物 ----------
       - name: "Determine artifact name"
         id: artifact
         run: |
@@ -172,16 +129,17 @@ jobs:
           else
             echo "name=build-false-false-false-true" >> $GITHUB_OUTPUT
           fi
+          
       - uses: actions/download-artifact@v8
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ./downloaded_artifact
-
+          
       - name: "Debug: List all downloaded files"
         run: |
           echo "Current directory: $(pwd)"
           ls -R ./downloaded_artifact
-
+          
       - name: "Find build_tests directory"
         id: find_build
         run: |
@@ -192,23 +150,36 @@ jobs:
           fi
           echo "Found build_tests at: $BUILD_DIR"
           echo "path=$BUILD_DIR" >> $GITHUB_OUTPUT
-
-      # ---------- 设置库路径 ----------
+          
       - name: "Set library paths"
         run: |
-          echo "LD_LIBRARY_PATH=${{ steps.find_build.outputs.path }}/lib:./downloaded_artifact/dp_test/lib:/usr/local/lib" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=${{ steps.find_build.outputs.path }}/lib:./downloaded_artifact/dp_test/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
 
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: "Install Python dependencies (CPU only)"
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-timeout pytest-cov pytest-split
+          # 分开安装以避免索引源冲突，使用普通 tensorflow
+          pip install tensorflow
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          
       - name: "Make scripts executable"
         run: chmod +x source/install/*.sh || true
 
-      # ---------- 单元测试 ----------
       - name: "Fix permissions for test binaries"
         run: |
           chmod +x ${{ steps.find_build.outputs.path }}/lib/tests/* || true
           chmod +x ${{ steps.find_build.outputs.path }}/api_c/tests/* || true
+          
       - name: "Compute shard index"
         id: compute_index
         run: echo "index=$(( ${{ matrix.shard }} - 1 ))" >> $GITHUB_OUTPUT
+        
       - name: "Run unit tests (shard ${{ matrix.shard }})"
         working-directory: ${{ steps.find_build.outputs.path }}
         run: |
@@ -217,7 +188,6 @@ jobs:
           OMP_NUM_THREADS: 1
           LD_LIBRARY_PATH: ${{ env.LD_LIBRARY_PATH }}
 
-      # ---------- LAMMPS 测试 ----------
       - name: "Run LAMMPS tests (shard ${{ matrix.shard }})"
         working-directory: ${{ github.workspace }}/source
         run: |
@@ -237,7 +207,6 @@ jobs:
           ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.backend_id == 'paddle' && '1' || '0' }}
 
-      # ---------- iPI 测试 ----------
       - name: "Run iPI tests (shard ${{ matrix.shard }})"
         working-directory: ${{ github.workspace }}/source
         run: |
@@ -257,7 +226,6 @@ jobs:
           ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.backend_id == 'paddle' && '1' || '0' }}
 
-      # ---------- 上传产物 ----------
       - name: "Upload durations"
         uses: actions/upload-artifact@v7
         with:
