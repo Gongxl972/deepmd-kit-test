@@ -123,7 +123,7 @@ jobs:
           include-hidden-files: true
 
   # ============================================================
-  # 2. 测试阶段（仅修复 CTest 权限、路径、pytest 收集错误）
+  # 2. 测试阶段（修复库缺失 + 性能优化）
   # ============================================================
   test_all:
     name: "All Tests (Shard ${{ matrix.shard }}, Backend: ${{ matrix.backend_id }})"
@@ -136,6 +136,34 @@ jobs:
         backend_id: ["tf_torch", "paddle"]
     steps:
       - uses: actions/checkout@v4
+
+      # ---------- 系统依赖（带缓存）----------
+      - name: "Cache APT packages"
+        uses: actions/cache@v6
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-gtest-${{ hashFiles('.github/workflows/test_cc.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-gtest-
+      - name: "Install system dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtest-dev cmake
+
+      # ---------- Python 环境（CPU 版本）----------
+      - name: "Set up Python"
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: "Install Python dependencies (CPU only)"
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-timeout pytest-cov pytest-split
+          # 强制安装 CPU 版本，避免拉取 CUDA 依赖
+          pip install tensorflow-cpu torch --index-url https://download.pytorch.org/whl/cpu
+
+      # ---------- 下载构建产物 ----------
       - name: "Determine artifact name"
         id: artifact
         run: |
@@ -148,30 +176,32 @@ jobs:
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ./downloaded_artifact
+
       - name: "Debug: List all downloaded files"
         run: |
           echo "Current directory: $(pwd)"
           ls -R ./downloaded_artifact
+
       - name: "Find build_tests directory"
         id: find_build
         run: |
           BUILD_DIR=$(find ./downloaded_artifact -type d -name "build_tests" | head -n 1)
           if [ -z "$BUILD_DIR" ]; then
             echo "Error: build_tests directory not found!"
-            echo "Searching for test executables..."
-            find . -type f -executable -name "*test*" || true
             exit 1
           fi
           echo "Found build_tests at: $BUILD_DIR"
           echo "path=$BUILD_DIR" >> $GITHUB_OUTPUT
-      - name: "Install Python dependencies"
+
+      # ---------- 设置库路径 ----------
+      - name: "Set library paths"
         run: |
-          python -m pip install --upgrade pip
-          pip install pytest pytest-timeout pytest-cov pytest-split
+          echo "LD_LIBRARY_PATH=${{ steps.find_build.outputs.path }}/lib:./downloaded_artifact/dp_test/lib:/usr/local/lib" >> $GITHUB_ENV
+
       - name: "Make scripts executable"
         run: chmod +x source/install/*.sh || true
 
-      # ---------- 单元测试（修复权限和路径）----------
+      # ---------- 单元测试 ----------
       - name: "Fix permissions for test binaries"
         run: |
           chmod +x ${{ steps.find_build.outputs.path }}/lib/tests/* || true
@@ -185,9 +215,9 @@ jobs:
           ctest -j4 --test-dir . -I ${{ steps.compute_index.outputs.index }},,12 --output-on-failure -C Release
         env:
           OMP_NUM_THREADS: 1
-          LD_LIBRARY_PATH: ${{ github.workspace }}/downloaded_artifact/dp_test/lib
+          LD_LIBRARY_PATH: ${{ env.LD_LIBRARY_PATH }}
 
-      # ---------- LAMMPS 测试（修复 pytest 收集错误）----------
+      # ---------- LAMMPS 测试 ----------
       - name: "Run LAMMPS tests (shard ${{ matrix.shard }})"
         working-directory: ${{ github.workspace }}/source
         run: |
@@ -207,7 +237,7 @@ jobs:
           ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.backend_id == 'paddle' && '1' || '0' }}
 
-      # ---------- iPI 测试（修复 pytest 收集错误）----------
+      # ---------- iPI 测试 ----------
       - name: "Run iPI tests (shard ${{ matrix.shard }})"
         working-directory: ${{ github.workspace }}/source
         run: |
@@ -221,12 +251,13 @@ jobs:
           OMP_NUM_THREADS: 1
           TF_INTRA_OP_PARALLELISM_THREADS: 1
           TF_INTER_OP_PARALLELISM_THREADS: 1
-          LD_LIBRARY_PATH: ${{ github.workspace }}/downloaded_artifact/dp_test/lib
+          LD_LIBRARY_PATH: ${{ env.LD_LIBRARY_PATH }}
           ENABLE_TENSORFLOW: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PYTORCH: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
           ENABLE_PADDLE: ${{ matrix.backend_id == 'paddle' && '1' || '0' }}
 
+      # ---------- 上传产物 ----------
       - name: "Upload durations"
         uses: actions/upload-artifact@v7
         with:
@@ -235,7 +266,6 @@ jobs:
             .test_durations_lmp_${{ matrix.backend_id }}
             .test_durations_ipi_${{ matrix.backend_id }}
           include-hidden-files: true
-
       - name: "Upload coverage to Codecov"
         uses: codecov/codecov-action@v7
         continue-on-error: true
