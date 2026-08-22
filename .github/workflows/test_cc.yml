@@ -2,9 +2,13 @@ name: Test CC
 
 on:
   push:
-    branches: [main, master]
+    branches-ignore:
+      - "gh-readonly-queue/**"
+      - "copilot/**"
+      - "dependabot/**"
+      - "pre-commit-ci-update-config"
   pull_request:
-    branches: [main, master]
+  merge_group:
 
 jobs:
   # ============================================================
