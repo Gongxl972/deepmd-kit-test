@@ -161,7 +161,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest pytest-timeout pytest-cov pytest-split
           # 强制安装 CPU 版本，避免拉取 CUDA 依赖
-          pip install tensorflow-cpu torch --index-url https://download.pytorch.org/whl/cpu
+          pip install tensorflow torch --index-url https://download.pytorch.org/whl/cpu
 
       # ---------- 下载构建产物 ----------
       - name: "Determine artifact name"
