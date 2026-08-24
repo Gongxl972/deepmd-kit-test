@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   # ============================================================
-  # 1. 构建阶段（4个任务，完全保留您之前的配置）
+  # 1. 构建阶段（4个任务，完全保留之前的配置）
   # ============================================================
   build:
     name: "Build C++ (${{ matrix.check_memleak }}, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
@@ -123,7 +123,7 @@ jobs:
           include-hidden-files: true
 
   # ============================================================
-  # 2. 测试阶段（修复依赖安装，与build保持一致）
+  # 2. 测试阶段（修复 MPI 缺失 + 保持与 build 一致的依赖安装）
   # ============================================================
   test_all:
     name: "All Tests (Shard ${{ matrix.shard }}, Backend: ${{ matrix.backend_id }})"
@@ -137,24 +137,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- 系统依赖（GTest）----------
+      # ---------- 系统依赖（GTest + MPI）----------
       - name: "Cache APT packages"
         uses: actions/cache@v6
         with:
           path: /var/cache/apt/archives
-          key: ${{ runner.os }}-apt-gtest-${{ hashFiles('.github/workflows/test_cc.yml') }}
+          key: ${{ runner.os }}-apt-gtest-mpi-${{ hashFiles('.github/workflows/test_cc.yml') }}
           restore-keys: |
-            ${{ runner.os }}-apt-gtest-
-      - name: "Install system dependencies"
+            ${{ runner.os }}-apt-gtest-mpi-
+      - name: "Install system dependencies (including MPI)"
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtest-dev cmake
-          # 编译GTest动态库（显式开启 BUILD_SHARED_LIBS）
+          sudo apt-get install -y libgtest-dev cmake mpich
+          # 编译GTest动态库
           cd /usr/src/googletest/googletest
           sudo cmake -DBUILD_SHARED_LIBS=ON .
           sudo make -j$(nproc)
           sudo cp lib/libgtest*.so /usr/lib/
           sudo ldconfig
+          # 确认 MPI 库路径
+          echo "MPI_LIB_DIR=/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       # ---------- Python环境（使用uv，与build阶段一致）----------
       - name: "Set up Python"
@@ -165,11 +168,8 @@ jobs:
       - name: "Install Python dependencies (CPU only, via uv)"
         run: |
           python -m pip install --upgrade pip uv
-          # 安装测试工具
           uv pip install --system pytest pytest-timeout pytest-cov pytest-split
-          # 安装CPU版本的tensorflow和pytorch（通过uv的pin组）
           source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --torch-backend cpu
-          # 安装当前包（用于导入deepmd）
           uv pip install --system -e .[cpu,test,lmp,torch]
         env:
           DP_ENABLE_PYTORCH: 1
@@ -204,10 +204,10 @@ jobs:
           echo "Found build_tests at: $BUILD_DIR"
           echo "path=$BUILD_DIR" >> $GITHUB_OUTPUT
 
-      # ---------- 设置库路径 ----------
+      # ---------- 设置库路径（包含 MPI 库）----------
       - name: "Set library paths"
         run: |
-          echo "LD_LIBRARY_PATH=${{ steps.find_build.outputs.path }}/lib:./downloaded_artifact/dp_test/lib:/usr/local/lib" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=${{ steps.find_build.outputs.path }}/lib:./downloaded_artifact/dp_test/lib:/usr/local/lib:/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
 
       - name: "Make scripts executable"
         run: chmod +x source/install/*.sh || true
