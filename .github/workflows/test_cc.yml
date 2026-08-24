@@ -149,9 +149,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtest-dev cmake
-          # 编译GTest库（如果apt只提供了源码）
+          # 编译GTest动态库（显式开启 BUILD_SHARED_LIBS）
           cd /usr/src/googletest/googletest
-          sudo cmake .
+          sudo cmake -DBUILD_SHARED_LIBS=ON .
           sudo make -j$(nproc)
           sudo cp lib/libgtest*.so /usr/lib/
           sudo ldconfig
@@ -168,7 +168,6 @@ jobs:
           # 安装测试工具
           uv pip install --system pytest pytest-timeout pytest-cov pytest-split
           # 安装CPU版本的tensorflow和pytorch（通过uv的pin组）
-          # 注意：这里假设build阶段使用的pin组可用，否则需要手动指定
           source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --torch-backend cpu
           # 安装当前包（用于导入deepmd）
           uv pip install --system -e .[cpu,test,lmp,torch]
