@@ -123,7 +123,7 @@ jobs:
           include-hidden-files: true
 
   # ============================================================
-  # 2. 测试阶段（修复 MPI 库冲突，使用系统 MPI）
+  # 2. 测试阶段（彻底解决 MPI 库冲突）
   # ============================================================
   test_all:
     name: "All Tests (Shard ${{ matrix.shard }}, Backend: ${{ matrix.backend_id }})"
@@ -155,26 +155,31 @@ jobs:
           sudo make -j$(nproc)
           sudo cp lib/libgtest*.so /usr/lib/
           sudo ldconfig
-          # 记录系统 MPI 库路径
+          # 记录系统 MPI 库路径（优先）
           echo "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          # 确认 mpirun 来自系统
+          which mpirun
+          mpirun --version
 
-      # ---------- Python环境（使用系统 MPI，避免 pip 的 mpich）----------
+      # ---------- Python环境（完全使用系统 MPI）----------
       - name: "Set up Python"
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
           cache: "pip"
-      - name: "Install Python dependencies (CPU only, system MPI)"
+      - name: "Install Python dependencies (system MPI only)"
         run: |
           python -m pip install --upgrade pip uv
+          # 移除可能存在的 pip 版 mpich 包（避免冲突）
+          pip uninstall -y mpich 2>/dev/null || true
           # 安装测试工具
           uv pip install --system pytest pytest-timeout pytest-cov pytest-split
           # 安装 CPU 版 TensorFlow 和 PyTorch
           source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --torch-backend cpu
-          # 安装 mpi4py，强制从源码编译以链接系统 MPI（避免 pip 的 mpich 二进制包）
+          # 安装 mpi4py，强制从源码编译（链接系统 mpich）
           pip install mpi4py --no-binary mpi4py
-          # 安装项目包，跳过 mpi4py 的二进制包（防止 uv 覆盖）
-          UV_NO_BINARY=mpi4py uv pip install --system -e .[cpu,test,lmp,torch]
+          # 安装项目包，跳过 mpi4py 和 mpich 的二进制包
+          UV_NO_BINARY=mpi4py,mpich uv pip install --system -e .[cpu,test,lmp,torch]
         env:
           DP_ENABLE_PYTORCH: 1
 
@@ -208,10 +213,10 @@ jobs:
           echo "Found build_tests at: $BUILD_DIR"
           echo "path=$BUILD_DIR" >> $GITHUB_OUTPUT
 
-      # ---------- 设置库路径（包含系统 MPI 库）----------
+      # ---------- 设置库路径（系统库优先）----------
       - name: "Set library paths"
         run: |
-          echo "LD_LIBRARY_PATH=${{ steps.find_build.outputs.path }}/lib:./downloaded_artifact/dp_test/lib:/usr/local/lib:/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${{ steps.find_build.outputs.path }}/lib:./downloaded_artifact/dp_test/lib:/usr/local/lib" >> $GITHUB_ENV
 
       - name: "Make scripts executable"
         run: chmod +x source/install/*.sh || true
