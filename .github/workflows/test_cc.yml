@@ -137,7 +137,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- 系统依赖（GTest + 系统 MPI）----------
+      # ---------- 系统依赖（GTest + 系统 MPI + 清理冲突库）----------
       - name: "Cache APT packages"
         uses: actions/cache@v6
         with:
@@ -145,7 +145,7 @@ jobs:
           key: ${{ runner.os }}-apt-gtest-mpi-${{ hashFiles('.github/workflows/test_cc.yml') }}
           restore-keys: |
             ${{ runner.os }}-apt-gtest-mpi-
-      - name: "Install system dependencies (GTest + system MPI)"
+      - name: "Install system dependencies (GTest + system MPI) and clean pip mpich"
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtest-dev cmake mpich libmpich-dev
@@ -155,6 +155,15 @@ jobs:
           sudo make -j$(nproc)
           sudo cp lib/libgtest*.so /usr/lib/
           sudo ldconfig
+          
+          # 🔥 彻底删除 pip 安装的 mpich 及其残留库
+          pip uninstall -y mpich 2>/dev/null || true
+          # 查找并删除 Python site-packages 下的任何 libmpi* 文件
+          PYTHON_SITE=$(python -c "import site; print(site.getsitepackages()[0])")
+          sudo find "$PYTHON_SITE" -name "libmpi*" -delete 2>/dev/null || true
+          # 更新 ldconfig 缓存
+          sudo ldconfig
+          
           # 记录系统 MPI 库路径（优先）
           echo "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           # 确认 mpirun 来自系统
@@ -170,7 +179,7 @@ jobs:
       - name: "Install Python dependencies (system MPI only)"
         run: |
           python -m pip install --upgrade pip uv
-          # 移除可能存在的 pip 版 mpich 包（避免冲突）
+          # 再次确保没有 pip 版 mpich
           pip uninstall -y mpich 2>/dev/null || true
           # 安装测试工具
           uv pip install --system pytest pytest-timeout pytest-cov pytest-split
@@ -220,6 +229,17 @@ jobs:
 
       - name: "Make scripts executable"
         run: chmod +x source/install/*.sh || true
+
+      # ---------- 创建 mpirun 包装脚本（确保环境变量传递）----------
+      - name: "Create mpirun wrapper"
+        run: |
+          cat > /tmp/mpirun_wrapper.sh << 'EOF'
+          #!/bin/bash
+          # 显式传递 LD_LIBRARY_PATH 给所有子进程
+          exec mpirun -env LD_LIBRARY_PATH "$LD_LIBRARY_PATH" "$@"
+          EOF
+          chmod +x /tmp/mpirun_wrapper.sh
+          echo "PATH=/tmp:$PATH" >> $GITHUB_ENV
 
       # ---------- 单元测试 ----------
       - name: "Fix permissions for test binaries"
