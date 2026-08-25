@@ -123,7 +123,7 @@ jobs:
           include-hidden-files: true
 
   # ============================================================
-  # 2. 测试阶段（修复 MPI 缺失 + 保持与 build 一致的依赖安装）
+  # 2. 测试阶段（修复 MPI 库冲突，使用系统 MPI）
   # ============================================================
   test_all:
     name: "All Tests (Shard ${{ matrix.shard }}, Backend: ${{ matrix.backend_id }})"
@@ -137,7 +137,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- 系统依赖（GTest + MPI）----------
+      # ---------- 系统依赖（GTest + 系统 MPI）----------
       - name: "Cache APT packages"
         uses: actions/cache@v6
         with:
@@ -145,32 +145,36 @@ jobs:
           key: ${{ runner.os }}-apt-gtest-mpi-${{ hashFiles('.github/workflows/test_cc.yml') }}
           restore-keys: |
             ${{ runner.os }}-apt-gtest-mpi-
-      - name: "Install system dependencies (including MPI)"
+      - name: "Install system dependencies (GTest + system MPI)"
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtest-dev cmake mpich
+          sudo apt-get install -y libgtest-dev cmake mpich libmpich-dev
           # 编译GTest动态库
           cd /usr/src/googletest/googletest
           sudo cmake -DBUILD_SHARED_LIBS=ON .
           sudo make -j$(nproc)
           sudo cp lib/libgtest*.so /usr/lib/
           sudo ldconfig
-          # 确认 MPI 库路径
-          echo "MPI_LIB_DIR=/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
+          # 记录系统 MPI 库路径
           echo "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
-      # ---------- Python环境（使用uv，与build阶段一致）----------
+      # ---------- Python环境（使用系统 MPI，避免 pip 的 mpich）----------
       - name: "Set up Python"
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
           cache: "pip"
-      - name: "Install Python dependencies (CPU only, via uv)"
+      - name: "Install Python dependencies (CPU only, system MPI)"
         run: |
           python -m pip install --upgrade pip uv
+          # 安装测试工具
           uv pip install --system pytest pytest-timeout pytest-cov pytest-split
+          # 安装 CPU 版 TensorFlow 和 PyTorch
           source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --torch-backend cpu
-          uv pip install --system -e .[cpu,test,lmp,torch]
+          # 安装 mpi4py，强制从源码编译以链接系统 MPI（避免 pip 的 mpich 二进制包）
+          pip install mpi4py --no-binary mpi4py
+          # 安装项目包，跳过 mpi4py 的二进制包（防止 uv 覆盖）
+          UV_NO_BINARY=mpi4py uv pip install --system -e .[cpu,test,lmp,torch]
         env:
           DP_ENABLE_PYTORCH: 1
 
@@ -204,7 +208,7 @@ jobs:
           echo "Found build_tests at: $BUILD_DIR"
           echo "path=$BUILD_DIR" >> $GITHUB_OUTPUT
 
-      # ---------- 设置库路径（包含 MPI 库）----------
+      # ---------- 设置库路径（包含系统 MPI 库）----------
       - name: "Set library paths"
         run: |
           echo "LD_LIBRARY_PATH=${{ steps.find_build.outputs.path }}/lib:./downloaded_artifact/dp_test/lib:/usr/local/lib:/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
