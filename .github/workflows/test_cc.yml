@@ -10,144 +10,238 @@ on:
   pull_request:
   merge_group:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+
 jobs:
+  # ============================================================
+  # 1. 构建阶段（4个任务，完全保留之前的配置）
+  # ============================================================
   build:
-    runs-on: ubuntu-slim
+    name: "Build C++ (${{ matrix.check_memleak }}, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
+    runs-on: ${{ (matrix.check_memleak == false && github.repository_owner == 'deepmodeling') && 'cpu' || 'ubuntu-22.04' }}
     strategy:
+      fail-fast: false
       matrix:
-        backend_id: [tf, torch, tf_torch, pytorch]
-        check_memleak: [true, false]
-        exclude:
-          - backend_id: tf
-            check_memleak: false
-          - backend_id: torch
-            check_memleak: true
-          - backend_id: tf_torch
-            check_memleak: false
-          - backend_id: pytorch
-            check_memleak: true
+        include:
+          - check_memleak: true
+            enable_tensorflow: true
+            enable_pytorch: true
+            enable_paddle: false
+          - check_memleak: true
+            enable_tensorflow: false
+            enable_pytorch: false
+            enable_paddle: true
+          - check_memleak: false
+            enable_tensorflow: true
+            enable_pytorch: true
+            enable_paddle: false
+          - check_memleak: false
+            enable_tensorflow: false
+            enable_pytorch: false
+            enable_paddle: true
+    outputs:
+      build_key: ${{ format('{0}-{1}-{2}-{3}', matrix.check_memleak, matrix.enable_tensorflow, matrix.enable_pytorch, matrix.enable_paddle) }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/setup.py') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Cache APT packages
-        uses: actions/cache@v4
-        with:
-          path: /var/cache/apt/archives
-          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/test_cc.yml') }}
-
-      - name: Install system dependencies
+      - name: "Install GCC"
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtest-dev cmake mpich libmpich-dev
-          # 编译 GTest 动态库
-          cd /usr/src/googletest
+          sudo apt-get install --yes build-essential
+        if: ${{ matrix.check_memleak == false && github.repository_owner == 'deepmodeling' }}
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - uses: lukka/get-cmake@latest
+      - run: python -m pip install uv
+      - name: "Install Python dependencies"
+        run: |
+          source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu --torch-backend cpu
+          export TENSORFLOW_ROOT=$(python -c 'import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec("tensorflow").origin).parent)')
+          export PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')
+          source/install/uv_with_retry.sh pip install --system -e .[cpu,test,lmp,jax,torch] mpi4py mpich
+        env:
+          DP_ENABLE_PYTORCH: 1
+      - name: "Convert models"
+        run: source/tests/infer/convert-models.sh
+      - name: "Fix kernel mmap rnd bits"
+        run: sudo sysctl vm.mmap_rnd_bits=28
+        if: ${{ matrix.check_memleak }}
+      - name: "Compile C++ library and unit test binaries"
+        run: source/install/test_cc_local.sh
+        env:
+          OMP_NUM_THREADS: 1
+          TF_INTRA_OP_PARALLELISM_THREADS: 1
+          TF_INTER_OP_PARALLELISM_THREADS: 1
+          CMAKE_GENERATOR: Ninja
+          CXXFLAGS: ${{ matrix.check_memleak && '-fsanitize=leak' || '' }}
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/workflows/suppr.txt
+          ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && 'TRUE' || 'FALSE' }}
+          ENABLE_PYTORCH: ${{ matrix.enable_pytorch && 'TRUE' || 'FALSE' }}
+          ENABLE_PADDLE: ${{ matrix.enable_paddle && 'TRUE' || 'FALSE' }}
+      # 收集单元测试时长
+      - name: "Collect unit test durations"
+        working-directory: ${{ github.workspace }}/source/build_tests
+        continue-on-error: true
+        run: |
+          if [ ! -f "CTestTestfile.cmake" ]; then
+            echo "No CTest configuration found, skipping duration collection."
+            exit 0
+          fi
+          ctest --show-only=json-v1 > ../.test_durations_unit.json
+        if: ${{ !matrix.check_memleak }}
+      # 拷贝 Paddle 库
+      - name: "Copy Paddle libs"
+        run: |
+          mkdir -p dp_test/lib
+          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/paddle/lib/*.so ${{ github.workspace }}/dp_test/lib/ || true
+          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/onednn/lib/* ${{ github.workspace }}/dp_test/lib/ || true
+          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/mklml/lib/* ${{ github.workspace }}/dp_test/lib/ || true
+        if: ${{ matrix.enable_paddle }}
+      # 上传编译产物
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_paddle }}
+          path: |
+            dp_test/
+            source/build_tests/
+          include-hidden-files: true
+      # 上传单元测试 durations
+      - name: "Upload durations"
+        uses: actions/upload-artifact@v7
+        if: ${{ !matrix.check_memleak }}
+        continue-on-error: true
+        with:
+          name: durations-unit-${{ matrix.check_memleak }}-${{ matrix.enable_tensorflow }}-${{ matrix.enable_pytorch }}-${{ matrix.enable_paddle }}
+          path: .test_durations_unit.json
+          if-no-files-found: ignore
+          include-hidden-files: true
+
+  # ============================================================
+  # 2. 测试阶段（彻底解决 MPI 库冲突：改用 OpenMPI）
+  # ============================================================
+  test_all:
+    name: "All Tests (Shard ${{ matrix.shard }}, Backend: ${{ matrix.backend_id }})"
+    needs: build
+    runs-on: ${{ (matrix.backend_id == 'tf_torch' && github.repository_owner == 'deepmodeling') && 'cpu' || 'ubuntu-22.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1,2,3,4,5,6,7,8,9,10,11,12]
+        backend_id: ["tf_torch", "paddle"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- 系统依赖（GTest + OpenMPI）----------
+      - name: "Cache APT packages"
+        uses: actions/cache@v6
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-gtest-openmpi-${{ hashFiles('.github/workflows/test_cc.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-gtest-openmpi-
+      - name: "Install system dependencies (GTest + OpenMPI)"
+        run: |
+          sudo apt-get update
+          # 改用 OpenMPI（提供 libmpi.so.12，兼容系统 libfabric）
+          sudo apt-get install -y libgtest-dev cmake openmpi-bin libopenmpi-dev
+          # 编译GTest动态库
+          cd /usr/src/googletest/googletest
           sudo cmake -DBUILD_SHARED_LIBS=ON .
           sudo make -j$(nproc)
-          sudo cp lib/*.so /usr/lib/
+          sudo cp lib/libgtest*.so /usr/lib/
           sudo ldconfig
-
-      - name: Remove pip mpich completely
-        run: |
-          # 暴力删除所有 pip 残留的 mpich 文件，防止冲突
-          find /opt/hostedtoolcache -name "*mpich*" -o -name "*mpi*" -path "*/site-packages/*" | xargs rm -rf 2>/dev/null || true
-          find /opt/hostedtoolcache -name "libmpi*" -type f -delete 2>/dev/null || true
-          # 重新安装系统 mpich
-          sudo apt-get install -y mpich libmpich-dev
-          sudo ldconfig
-          echo "=== System mpirun ==="
+          # 记录系统 MPI 库路径（优先）
+          echo "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu/openmpi/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          # 确认 mpirun 来自系统
           which mpirun
           mpirun --version
 
-      - name: Force system MPI library
+      # ---------- Python环境（完全使用系统 OpenMPI）----------
+      - name: "Set up Python"
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: "Install Python dependencies (system OpenMPI only)"
         run: |
-          SYSTEM_MPI=$(find /usr/lib -name "libmpi.so.12" 2>/dev/null | head -1)
-          if [ -z "$SYSTEM_MPI" ]; then
-            # 如果系统没有 libmpi.so.12，尝试创建软链接指向系统 libmpich.so
-            sudo ln -sf /usr/lib/x86_64-linux-gnu/libmpich.so /usr/lib/x86_64-linux-gnu/libmpi.so.12 2>/dev/null || true
-            SYSTEM_MPI="/usr/lib/x86_64-linux-gnu/libmpi.so.12"
-          fi
-          echo "LD_PRELOAD=${SYSTEM_MPI}" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
-
-      - name: Install Python dependencies
+          python -m pip install --upgrade pip uv
+          # 彻底清除 pip 版 mpich 残留（包括缓存）
+          pip uninstall -y mpich 2>/dev/null || true
+          find /opt/hostedtoolcache -name "*mpich*" -o -name "*mpi*" -path "*/site-packages/*" | xargs rm -rf 2>/dev/null || true
+          find /opt/hostedtoolcache -name "libmpi*" -type f -delete 2>/dev/null || true
+          # 安装测试工具
+          uv pip install --system pytest pytest-timeout pytest-cov pytest-split
+          # 安装 CPU 版 TensorFlow 和 PyTorch
+          source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --torch-backend cpu
+          # 安装 mpi4py，强制从源码编译（链接系统 OpenMPI）
+          pip install mpi4py --no-binary mpi4py
+          # 安装项目包，跳过 mpi4py 和 mpich 的二进制包
+          UV_NO_BINARY=mpi4py,mpich uv pip install --system -e .[cpu,test,lmp,torch]
         env:
-          UV_NO_BINARY: mpi4py,mpich
+          DP_ENABLE_PYTORCH: 1
+
+      # ---------- 下载构建产物 ----------
+      - name: "Determine artifact name"
+        id: artifact
         run: |
-          pip install --upgrade pip uv
-          # 强制从源码编译 mpi4py 链接系统 MPI
-          pip install --no-binary mpi4py mpi4py
-          uv pip install --system -e .[test,tf,torch]
+          if [ "${{ matrix.backend_id }}" = "tf_torch" ]; then
+            echo "name=build-false-true-true-false" >> $GITHUB_OUTPUT
+          else
+            echo "name=build-false-false-false-true" >> $GITHUB_OUTPUT
+          fi
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: ./downloaded_artifact
 
-      - name: Build
-        working-directory: ${{ github.workspace }}
+      - name: "Debug: List all downloaded files"
         run: |
-          mkdir -p build
-          cd build
-          # 显式指定源码目录为 source/，解决 CMakeLists.txt 找不到的问题
-          cmake -S ../source -B . \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=ON \
-            -DENABLE_TENSORFLOW=${{ matrix.backend_id == 'tf' || matrix.backend_id == 'tf_torch' && '1' || '0' }} \
-            -DENABLE_PYTORCH=${{ matrix.backend_id == 'torch' || matrix.backend_id == 'tf_torch' || matrix.backend_id == 'pytorch' && '1' || '0' }} \
-            -DCHECK_MEMLEAK=${{ matrix.check_memleak && '1' || '0' }}
-          cmake --build . --config Release --parallel $(nproc)
+          echo "Current directory: $(pwd)"
+          ls -R ./downloaded_artifact
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: build-${{ matrix.backend_id }}-memleak-${{ matrix.check_memleak }}
-          path: build/
-
-  test_all:
-    needs: [build]
-    runs-on: ubuntu-slim
-    strategy:
-      matrix:
-        backend_id: [tf_torch, paddle]
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: build-${{ matrix.backend_id }}-memleak-false
-          path: build/
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Python deps
+      - name: "Find build_tests directory"
+        id: find_build
         run: |
-          pip install --upgrade pip uv
-          pip install --no-binary mpi4py mpi4py
-          uv pip install --system -e .[test,tf,torch]
+          BUILD_DIR=$(find ./downloaded_artifact -type d -name "build_tests" | head -n 1)
+          if [ -z "$BUILD_DIR" ]; then
+            echo "Error: build_tests directory not found!"
+            exit 1
+          fi
+          echo "Found build_tests at: $BUILD_DIR"
+          echo "path=$BUILD_DIR" >> $GITHUB_OUTPUT
 
-      - name: Set library paths
+      # ---------- 设置库路径（系统库优先）----------
+      - name: "Set library paths"
         run: |
-          echo "LD_LIBRARY_PATH=${{ github.workspace }}/build:${{ github.workspace }}/source/build:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu/openmpi/lib:${{ steps.find_build.outputs.path }}/lib:./downloaded_artifact/dp_test/lib:/usr/local/lib" >> $GITHUB_ENV
 
-      # ---------- LMP 测试 ----------
-      - name: "Run LMP tests (shard ${{ matrix.shard }})"
+      - name: "Make scripts executable"
+        run: chmod +x source/install/*.sh || true
+
+      # ---------- 单元测试 ----------
+      - name: "Fix permissions for test binaries"
+        run: |
+          chmod +x ${{ steps.find_build.outputs.path }}/lib/tests/* || true
+          chmod +x ${{ steps.find_build.outputs.path }}/api_c/tests/* || true
+      - name: "Compute shard index"
+        id: compute_index
+        run: echo "index=$(( ${{ matrix.shard }} - 1 ))" >> $GITHUB_OUTPUT
+      - name: "Run unit tests (shard ${{ matrix.shard }})"
+        working-directory: ${{ steps.find_build.outputs.path }}
+        run: |
+          ctest -j4 --test-dir . -I ${{ steps.compute_index.outputs.index }},,12 --output-on-failure -C Release
+        env:
+          OMP_NUM_THREADS: 1
+          LD_LIBRARY_PATH: ${{ env.LD_LIBRARY_PATH }}
+
+      # ---------- LAMMPS 测试 ----------
+      - name: "Run LAMMPS tests (shard ${{ matrix.shard }})"
         working-directory: ${{ github.workspace }}/source
         run: |
           python -m pytest --timeout=300 --cov=deepmd lmp/tests \
@@ -203,6 +297,9 @@ jobs:
           use_oidc: true
           flags: all,${{ matrix.backend_id }},shard${{ matrix.shard }}
 
+  # ============================================================
+  # 3. 合并 durations
+  # ============================================================
   update_durations:
     name: "Combine durations"
     runs-on: ubuntu-slim
@@ -228,6 +325,9 @@ jobs:
           key: testcc-durations-${{ github.sha }}
           restore-keys: testcc-durations-
 
+  # ============================================================
+  # 4. 汇总 pass
+  # ============================================================
   pass:
     name: "Pass testing C++"
     needs: [build, test_all, update_durations]
