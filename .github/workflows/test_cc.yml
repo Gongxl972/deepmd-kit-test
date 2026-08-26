@@ -12,72 +12,44 @@ on:
 
 jobs:
   build:
+    runs-on: ubuntu-slim
     strategy:
-      fail-fast: false
       matrix:
-        backend: [tf, torch, tf_torch, pytorch]
+        backend_id: [tf, torch, tf_torch, pytorch]
         check_memleak: [true, false]
         exclude:
-          - backend: tf
+          - backend_id: tf
             check_memleak: false
-          - backend: torch
+          - backend_id: torch
             check_memleak: true
-          - backend: tf_torch
+          - backend_id: tf_torch
             check_memleak: false
-          - backend: pytorch
+          - backend_id: pytorch
             check_memleak: true
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/setup.py', '**/requirements.txt') }}
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install cmake ninja
-          sudo apt-get update
-          sudo apt-get install -y libgtest-dev mpich libmpich-dev
-          # 编译 GTest 动态库
-          cd /usr/src/googletest
-          sudo cmake -DBUILD_SHARED_LIBS=ON .
-          sudo make -j$(nproc)
-          sudo cp lib/*.so /usr/lib/
-          sudo ldconfig
-      - name: Build
-        run: |
-          mkdir build && cd build
-          cmake .. -DENABLE_TF=${{ matrix.backend == 'tf' || matrix.backend == 'tf_torch' }} \
-                   -DENABLE_TORCH=${{ matrix.backend == 'torch' || matrix.backend == 'tf_torch' || matrix.backend == 'pytorch' }} \
-                   -DENABLE_PYTORCH=${{ matrix.backend == 'pytorch' }} \
-                   -DCHECK_MEMLEAK=${{ matrix.check_memleak }}
-          make -j$(nproc)
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/setup.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-  test_all:
-    needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        backend: [tf_torch]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
       - name: Cache APT packages
         uses: actions/cache@v4
         with:
           path: /var/cache/apt/archives
           key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/test_cc.yml') }}
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -88,42 +60,180 @@ jobs:
           sudo make -j$(nproc)
           sudo cp lib/*.so /usr/lib/
           sudo ldconfig
+
       - name: Remove pip mpich completely
         run: |
-          # 暴力删除所有 pip 残留的 mpich 文件
+          # 暴力删除所有 pip 残留的 mpich 文件，防止冲突
           find /opt/hostedtoolcache -name "*mpich*" -o -name "*mpi*" -path "*/site-packages/*" | xargs rm -rf 2>/dev/null || true
           find /opt/hostedtoolcache -name "libmpi*" -type f -delete 2>/dev/null || true
-          # 重新安装系统 mpich（确保）
+          # 重新安装系统 mpich
           sudo apt-get install -y mpich libmpich-dev
           sudo ldconfig
           echo "=== System mpirun ==="
           which mpirun
           mpirun --version
+
       - name: Force system MPI library
         run: |
           SYSTEM_MPI=$(find /usr/lib -name "libmpi.so.12" 2>/dev/null | head -1)
           if [ -z "$SYSTEM_MPI" ]; then
-            # 如果系统没有 libmpi.so.12，尝试创建软链接（通常系统 mpich 会提供 libmpich.so）
+            # 如果系统没有 libmpi.so.12，尝试创建软链接指向系统 libmpich.so
             sudo ln -sf /usr/lib/x86_64-linux-gnu/libmpich.so /usr/lib/x86_64-linux-gnu/libmpi.so.12 2>/dev/null || true
             SYSTEM_MPI="/usr/lib/x86_64-linux-gnu/libmpi.so.12"
           fi
           echo "LD_PRELOAD=${SYSTEM_MPI}" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
+
       - name: Install Python dependencies
         env:
           UV_NO_BINARY: mpi4py,mpich
         run: |
           pip install --upgrade pip uv
-          # 安装 mpi4py 时强制从源码编译并链接系统 MPI
+          # 强制从源码编译 mpi4py 链接系统 MPI
           pip install --no-binary mpi4py mpi4py
-          # 安装其他依赖（使用 uv 加速）
           uv pip install --system -e .[test,tf,torch]
-      - name: Set library paths (final)
+
+      - name: Build
+        working-directory: ${{ github.workspace }}
         run: |
-          echo "LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
-          echo "LD_PRELOAD=${LD_PRELOAD}" >> $GITHUB_ENV
-      - name: Run tests (shard ${{ matrix.shard }})
+          mkdir -p build
+          cd build
+          # 显式指定源码目录为 source/，解决 CMakeLists.txt 找不到的问题
+          cmake -S ../source -B . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DENABLE_TENSORFLOW=${{ matrix.backend_id == 'tf' || matrix.backend_id == 'tf_torch' && '1' || '0' }} \
+            -DENABLE_PYTORCH=${{ matrix.backend_id == 'torch' || matrix.backend_id == 'tf_torch' || matrix.backend_id == 'pytorch' && '1' || '0' }} \
+            -DCHECK_MEMLEAK=${{ matrix.check_memleak && '1' || '0' }}
+          cmake --build . --config Release --parallel $(nproc)
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.backend_id }}-memleak-${{ matrix.check_memleak }}
+          path: build/
+
+  test_all:
+    needs: [build]
+    runs-on: ubuntu-slim
+    strategy:
+      matrix:
+        backend_id: [tf_torch, paddle]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: build-${{ matrix.backend_id }}-memleak-false
+          path: build/
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
         run: |
-          python -m pytest --timeout=300 --cov=deepmd -x -v \
+          pip install --upgrade pip uv
+          pip install --no-binary mpi4py mpi4py
+          uv pip install --system -e .[test,tf,torch]
+
+      - name: Set library paths
+        run: |
+          echo "LD_LIBRARY_PATH=${{ github.workspace }}/build:${{ github.workspace }}/source/build:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
+      # ---------- LMP 测试 ----------
+      - name: "Run LMP tests (shard ${{ matrix.shard }})"
+        working-directory: ${{ github.workspace }}/source
+        run: |
+          python -m pytest --timeout=300 --cov=deepmd lmp/tests \
             --splits 12 --group ${{ matrix.shard }} \
-            source/lmp/tests/
+            --splitting-algorithm least_duration \
+            --store-durations --clean-durations \
+            --durations-path=../.test_durations_lmp_${{ matrix.backend_id }} \
+            --continue-on-collection-errors
+        env:
+          OMP_NUM_THREADS: 1
+          TF_INTRA_OP_PARALLELISM_THREADS: 1
+          TF_INTER_OP_PARALLELISM_THREADS: 1
+          LAMMPS_PLUGIN_PATH: ${{ github.workspace }}/downloaded_artifact/dp_test/lib/deepmd_lmp
+          LD_LIBRARY_PATH: ${{ env.LD_LIBRARY_PATH }}
+          ENABLE_TENSORFLOW: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
+          ENABLE_PYTORCH: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
+          ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
+          ENABLE_PADDLE: ${{ matrix.backend_id == 'paddle' && '1' || '0' }}
+
+      # ---------- iPI 测试 ----------
+      - name: "Run iPI tests (shard ${{ matrix.shard }})"
+        working-directory: ${{ github.workspace }}/source
+        run: |
+          python -m pytest --timeout=300 --cov=deepmd ipi/tests \
+            --splits 12 --group ${{ matrix.shard }} \
+            --splitting-algorithm least_duration \
+            --store-durations --clean-durations \
+            --durations-path=../.test_durations_ipi_${{ matrix.backend_id }} \
+            --continue-on-collection-errors
+        env:
+          OMP_NUM_THREADS: 1
+          TF_INTRA_OP_PARALLELISM_THREADS: 1
+          TF_INTER_OP_PARALLELISM_THREADS: 1
+          LD_LIBRARY_PATH: ${{ env.LD_LIBRARY_PATH }}
+          ENABLE_TENSORFLOW: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
+          ENABLE_PYTORCH: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
+          ENABLE_JAX: ${{ matrix.backend_id == 'tf_torch' && '1' || '0' }}
+          ENABLE_PADDLE: ${{ matrix.backend_id == 'paddle' && '1' || '0' }}
+
+      # ---------- 上传产物 ----------
+      - name: "Upload durations"
+        uses: actions/upload-artifact@v7
+        with:
+          name: durations-${{ matrix.backend_id }}-${{ matrix.shard }}
+          path: |
+            .test_durations_lmp_${{ matrix.backend_id }}
+            .test_durations_ipi_${{ matrix.backend_id }}
+          include-hidden-files: true
+      - name: "Upload coverage to Codecov"
+        uses: codecov/codecov-action@v7
+        continue-on-error: true
+        with:
+          use_oidc: true
+          flags: all,${{ matrix.backend_id }},shard${{ matrix.shard }}
+
+  update_durations:
+    name: "Combine durations"
+    runs-on: ubuntu-slim
+    needs: [test_all]
+    if: always()
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: durations-*
+          merge-multiple: true
+      - name: "Merge durations"
+        run: |
+          for backend in tf_torch paddle; do
+            jq -s 'reduce .[] as $d ({}; . * $d)' .test_durations_lmp_${backend}_* > .test_durations_lmp_${backend}
+            jq -s 'reduce .[] as $d ({}; . * $d)' .test_durations_ipi_${backend}_* > .test_durations_ipi_${backend}
+          done
+      - name: "Cache combined durations"
+        uses: actions/cache@v6
+        with:
+          path: |
+            .test_durations_lmp_*
+            .test_durations_ipi_*
+          key: testcc-durations-${{ github.sha }}
+          restore-keys: testcc-durations-
+
+  pass:
+    name: "Pass testing C++"
+    needs: [build, test_all, update_durations]
+    if: always()
+    runs-on: ubuntu-slim
+    steps:
+      - uses: re-actors/alls-green@release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}
