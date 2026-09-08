@@ -2,17 +2,9 @@ name: Test C++
 
 on:
   push:
-    branches-ignore:
-      - "gh-readonly-queue/**"
-      - "copilot/**"
-      - "dependabot/**"
-      - "pre-commit-ci-update-config"
+    branches: [*]
   pull_request:
-  merge_group:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+    branches: [main, v*]
 
 jobs:
   build:
@@ -26,26 +18,20 @@ jobs:
         enable_pytorch: [true, false]
         enable_paddle: [true, false]
         exclude:
-          # 保留 4 个核心组合（根据你的实际需要调整）
           - enable_tensorflow: true
             enable_pytorch: true
           - enable_tensorflow: true
             enable_paddle: true
           - enable_pytorch: true
             enable_paddle: true
+          # 排除无意义组合
           - enable_tensorflow: false
             enable_pytorch: false
             enable_paddle: false
-          # 如果 memleak 只需跑一个组合，可额外排除
-          - check_memleak: true
-            enable_tensorflow: false
-          - check_memleak: true
-            enable_pytorch: true
-
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 避免 git describe 报错（若无可忽略）
+          fetch-depth: 0
 
       - name: "Set up Python"
         uses: actions/setup-python@v4
@@ -53,48 +39,31 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: "Cache APT packages"
-        uses: actions/cache@v6
-        with:
-          path: /var/cache/apt/archives
-          key: ${{ runner.os }}-apt-build-${{ hashFiles('.github/workflows/test_cc.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-apt-build-
-
-      - name: "Install system dependencies"
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtest-dev cmake ninja-build git mpich libmpich-dev
-          # 编译 GTest 动态库
-          cd /usr/src/googletest/googletest
-          sudo cmake -DBUILD_SHARED_LIBS=ON .
-          sudo make -j$(nproc)
-          sudo cp lib/libgtest*.so /usr/lib/
-          sudo ldconfig
+      - name: "Fix kernel mmap rnd bits"
+        run: sudo sysctl vm.mmap_rnd_bits=28
+        if: ${{ matrix.check_memleak }}
 
       - name: "Install Python dependencies (build)"
         run: |
           python -m pip install --upgrade pip uv
-          # 安装基础工具
-          uv pip install --system pytest pytest-timeout pytest-cov pytest-split
-          # 条件安装后端依赖
+          # 安装基础构建依赖
+          uv pip install --system pytest pytest-timeout pytest-cov pytest-split cmake ninja
+          # 根据后端安装对应依赖
           if [ "${{ matrix.enable_tensorflow }}" == "true" ]; then
             source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_cpu
           fi
           if [ "${{ matrix.enable_pytorch }}" == "true" ]; then
             source/install/uv_with_retry.sh pip install --system --group pin_pytorch_cpu --torch-backend cpu
+            # 显式安装 e3nn，解决 PyTorch 后端构建时的 ModuleNotFoundError
+            pip install e3nn
           fi
           if [ "${{ matrix.enable_paddle }}" == "true" ]; then
-            # 根据实际项目补充 paddle 安装命令，例如：
-            # uv pip install --system paddlepaddle
-            echo "Paddle enabled, please ensure paddle deps are installed if needed"
+            pip install paddlepaddle
           fi
-          # 安装项目（不含测试额外依赖，加快构建）
-          uv pip install --system -e .[cpu]
-
-      - name: "Fix kernel mmap rnd bits"
-        run: sudo sysctl vm.mmap_rnd_bits=28
-        if: ${{ matrix.check_memleak }}
+          # 安装项目基础依赖（非测试）
+          UV_NO_BINARY=mpi4py,mpich uv pip install --system -e .[cpu]
+        env:
+          DP_ENABLE_PYTORCH: ${{ matrix.enable_pytorch && '1' || '0' }}
 
       - name: "Compile C++ library and unit test binaries"
         run: source/install/test_cc_local.sh
@@ -108,10 +77,8 @@ jobs:
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && 'TRUE' || 'FALSE' }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch && 'TRUE' || 'FALSE' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && 'TRUE' || 'FALSE' }}
-          # 显式指定 Python 路径，避免 CMake 找错
-          Python_EXECUTABLE: /opt/hostedtoolcache/Python/3.11.16/x64/bin/python3
-          # 忽略 git describe 失败
-          DP_KIT_VERSION: "test-build"
+          Python_EXECUTABLE: /opt/hostedtoolcache/Python/3.11.16/x64/bin/python3.11
+          DP_KIT_VERSION: dummy_version
 
       # 收集单元测试时长
       - name: "Collect unit test durations"
@@ -216,6 +183,10 @@ jobs:
           uv pip install --system pytest pytest-timeout pytest-cov pytest-split
           # 安装 CPU 版 TensorFlow 和 PyTorch
           source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --torch-backend cpu
+          # 如果是 tf_torch 后端，确保安装 e3nn（PyTorch 相关模型需要）
+          if [ "${{ matrix.backend_id }}" = "tf_torch" ]; then
+            pip install e3nn
+          fi
           # 强制从源码编译 mpi4py，链接系统 OpenMPI
           env MPICC=mpicc pip install --no-cache-dir --no-binary mpi4py mpi4py
           # 安装项目包，跳过 mpi4py 和 mpich 的二进制包
