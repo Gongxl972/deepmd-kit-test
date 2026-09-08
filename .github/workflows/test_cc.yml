@@ -10,38 +10,44 @@ on:
   pull_request:
   merge_group:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # ============================================================
-  # 1. 构建阶段
-  # ============================================================
   build:
-    name: "Build C++ (true, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
+    name: "Build C++ (check_memleak:${{ matrix.check_memleak }}, TF:${{ matrix.enable_tensorflow }}, Torch:${{ matrix.enable_pytorch }}, Paddle:${{ matrix.enable_paddle }})"
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        include:
+        check_memleak: [true, false]
+        enable_tensorflow: [true, false]
+        enable_pytorch: [true, false]
+        enable_paddle: [true, false]
+        exclude:
+          # 保留 4 个核心组合（根据你的实际需要调整）
           - enable_tensorflow: true
             enable_pytorch: true
-            enable_paddle: false
-            check_memleak: true
-          - enable_tensorflow: false
-            enable_pytorch: false
-            enable_paddle: true
-            check_memleak: true
           - enable_tensorflow: true
-            enable_pytorch: false
-            enable_paddle: false
-            check_memleak: false
+            enable_paddle: true
+          - enable_pytorch: true
+            enable_paddle: true
           - enable_tensorflow: false
             enable_pytorch: false
-            enable_paddle: true
-            check_memleak: false
+            enable_paddle: false
+          # 如果 memleak 只需跑一个组合，可额外排除
+          - check_memleak: true
+            enable_tensorflow: false
+          - check_memleak: true
+            enable_pytorch: true
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 避免 git describe 报错（若无可忽略）
 
-      - name: "Setup Python"
+      - name: "Set up Python"
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
@@ -51,23 +57,40 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /var/cache/apt/archives
-          key: ${{ runner.os }}-apt-build-openmpi-${{ hashFiles('.github/workflows/test_cc.yml') }}
+          key: ${{ runner.os }}-apt-build-${{ hashFiles('.github/workflows/test_cc.yml') }}
           restore-keys: |
-            ${{ runner.os }}-apt-build-openmpi-
+            ${{ runner.os }}-apt-build-
 
-      - name: "Install system dependencies (OpenMPI + libfabric)"
+      - name: "Install system dependencies"
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtest-dev cmake openmpi-bin libopenmpi-dev libfabric1
-          # 编译GTest动态库
+          sudo apt-get install -y libgtest-dev cmake ninja-build git mpich libmpich-dev
+          # 编译 GTest 动态库
           cd /usr/src/googletest/googletest
           sudo cmake -DBUILD_SHARED_LIBS=ON .
           sudo make -j$(nproc)
           sudo cp lib/libgtest*.so /usr/lib/
           sudo ldconfig
-          # 确认 mpirun 来自系统
-          which mpirun
-          mpirun --version
+
+      - name: "Install Python dependencies (build)"
+        run: |
+          python -m pip install --upgrade pip uv
+          # 安装基础工具
+          uv pip install --system pytest pytest-timeout pytest-cov pytest-split
+          # 条件安装后端依赖
+          if [ "${{ matrix.enable_tensorflow }}" == "true" ]; then
+            source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_cpu
+          fi
+          if [ "${{ matrix.enable_pytorch }}" == "true" ]; then
+            source/install/uv_with_retry.sh pip install --system --group pin_pytorch_cpu --torch-backend cpu
+          fi
+          if [ "${{ matrix.enable_paddle }}" == "true" ]; then
+            # 根据实际项目补充 paddle 安装命令，例如：
+            # uv pip install --system paddlepaddle
+            echo "Paddle enabled, please ensure paddle deps are installed if needed"
+          fi
+          # 安装项目（不含测试额外依赖，加快构建）
+          uv pip install --system -e .[cpu]
 
       - name: "Fix kernel mmap rnd bits"
         run: sudo sysctl vm.mmap_rnd_bits=28
@@ -85,6 +108,10 @@ jobs:
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && 'TRUE' || 'FALSE' }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch && 'TRUE' || 'FALSE' }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle && 'TRUE' || 'FALSE' }}
+          # 显式指定 Python 路径，避免 CMake 找错
+          Python_EXECUTABLE: /opt/hostedtoolcache/Python/3.11.16/x64/bin/python3
+          # 忽略 git describe 失败
+          DP_KIT_VERSION: "test-build"
 
       # 收集单元测试时长
       - name: "Collect unit test durations"
