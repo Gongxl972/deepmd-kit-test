@@ -1,3 +1,5 @@
+name: Test C++ parallel (buildcc → lammps/ipi)
+
 on:
   push:
     branches-ignore:
@@ -7,126 +9,219 @@ on:
       - "pre-commit-ci-update-config"
   pull_request:
   merge_group:
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
   cancel-in-progress: true
-name: Test C++
+
 jobs:
-  testcc:
-    name: Test C++
-    runs-on: ${{ matrix.check_memleak == false && github.repository_owner == 'deepmodeling' && 'cpu' || 'ubuntu-22.04' }}
-    # Paddle's external interface download is occasionally unavailable. Keep
-    # exercising these configurations without making that outage blocking.
-    continue-on-error: ${{ matrix.enable_paddle }}
+  # ================================================================
+  # Build + CTest (直接复用 test_cc_local.sh)
+  # ================================================================
+  buildcc:
+    name: Build & CTest (${{ matrix.backend }}, memleak=${{ matrix.memleak }})
+    runs-on: ubuntu-22.04
     strategy:
-      # An allowed Paddle failure must not cancel the other backend jobs.
       fail-fast: false
       matrix:
-        # Only regular jobs run the LAMMPS tests. Use self-hosted CPU runners
-        # for those jobs in deepmodeling, with a hosted fallback for forks.
         include:
-          - check_memleak: true
-            enable_tensorflow: true
-            enable_pytorch: true
-            enable_paddle: false
-          - check_memleak: true
-            enable_tensorflow: false
-            enable_pytorch: false
-            enable_paddle: true
-          - check_memleak: false
-            enable_tensorflow: true
-            enable_pytorch: true
-            enable_paddle: false
-          - check_memleak: false
-            enable_tensorflow: false
-            enable_pytorch: false
-            enable_paddle: true
+          - memleak: true
+            backend: tf_torch
+            enable_tensorflow: TRUE
+            enable_pytorch: TRUE
+            enable_paddle: FALSE
+          - memleak: true
+            backend: paddle
+            enable_tensorflow: FALSE
+            enable_pytorch: FALSE
+            enable_paddle: TRUE
+          - memleak: false
+            backend: tf_torch
+            enable_tensorflow: TRUE
+            enable_pytorch: TRUE
+            enable_paddle: FALSE
+          - memleak: false
+            backend: paddle
+            enable_tensorflow: FALSE
+            enable_pytorch: FALSE
+            enable_paddle: TRUE
     steps:
       - uses: actions/checkout@v7
-      - name: Install GCC
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes build-essential
-        if: ${{ matrix.check_memleak == false && github.repository_owner == 'deepmodeling' }}
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: "pip"
-      - uses: lukka/get-cmake@latest
-      - run: python -m pip install uv
-      - name: Install Python dependencies
+      - name: System dependencies
         run: |
-          source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu --torch-backend cpu
-          export TENSORFLOW_ROOT=$(python -c 'import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec("tensorflow").origin).parent)')
-          export PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')
-          source/install/uv_with_retry.sh pip install --system -e .[cpu,test,lmp,jax,torch] mpi4py mpich
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential cmake ninja-build libgtest-dev \
+            openmpi-bin libopenmpi-dev libfabric1 \
+            libfftw3-dev libgomp1
+      - run: python -m pip install uv
+      - name: Install Python deps (build & test)
+        run: |
+          if [ "${{ matrix.backend }}" = "tf_torch" ]; then
+            source/install/uv_with_retry.sh pip install --system \
+              --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu \
+              --torch-backend cpu
+            source/install/uv_with_retry.sh pip install --system \
+              -e .[cpu,test,lmp,ipi,jax,torch] mpi4py
+          else
+            source/install/uv_with_retry.sh pip install --system \
+              -e .[cpu,test,lmp,ipi] mpi4py
+            source/install/uv_with_retry.sh pip install --system paddlepaddle
+          fi
+      - name: Export backend roots (for TF/PT)
+        if: matrix.backend == 'tf_torch'
+        run: |
+          echo "TENSORFLOW_ROOT=$(python -c 'import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec("tensorflow").origin).parent)')" >> "$GITHUB_ENV"
+          echo "PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')" >> "$GITHUB_ENV"
+      - name: Build & CTest (via test_cc_local.sh)
         env:
-          DP_ENABLE_PYTORCH: 1
-      - name: Convert models
-        run: source/tests/infer/convert-models.sh
-      # https://github.com/actions/runner-images/issues/9491
-      - name: Fix kernel mmap rnd bits
-        run: sudo sysctl vm.mmap_rnd_bits=28
-        if: ${{ matrix.check_memleak }}
-      - run: |
-          source/install/test_cc_local.sh
-        env:
-          OMP_NUM_THREADS: 1
-          TF_INTRA_OP_PARALLELISM_THREADS: 1
-          TF_INTER_OP_PARALLELISM_THREADS: 1
-          CMAKE_GENERATOR: Ninja
-          CXXFLAGS: ${{ matrix.check_memleak && '-fsanitize=leak' || '' }}
+          DP_VARIANT: cpu
+          ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow }}
+          ENABLE_PYTORCH: ${{ matrix.enable_pytorch }}
+          ENABLE_PADDLE: ${{ matrix.enable_paddle }}
+          CXXFLAGS: ${{ matrix.memleak && '-fsanitize=leak -g' || '-g' }}
           LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/workflows/suppr.txt
-          ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && 'TRUE' || 'FALSE' }}
-          ENABLE_PYTORCH: ${{ matrix.enable_pytorch && 'TRUE' || 'FALSE' }}
-          ENABLE_PADDLE: ${{ matrix.enable_paddle && 'TRUE' || 'FALSE' }}
-      # test lammps
-      - run: |
-          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/paddle/lib/*.so ${{ github.workspace }}/dp_test/lib/
-          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/onednn/lib/* ${{ github.workspace }}/dp_test/lib/
-          cp ${{ github.workspace }}/source/build_tests/paddle_inference_install_dir/third_party/install/mklml/lib/* ${{ github.workspace }}/dp_test/lib/
-        if: matrix.enable_paddle
-      - run: |
-          export LD_LIBRARY_PATH=${{ github.workspace }}/dp_test/lib:$LD_LIBRARY_PATH
-          source/install/retry_on_sigterm.sh 3 pytest --cov=deepmd source/lmp/tests
-        env:
-          OMP_NUM_THREADS: 1
-          TF_INTRA_OP_PARALLELISM_THREADS: 1
-          TF_INTER_OP_PARALLELISM_THREADS: 1
-          LAMMPS_PLUGIN_PATH: ${{ github.workspace }}/dp_test/lib/deepmd_lmp
-          ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && '1' || '0' }}
-          ENABLE_PYTORCH: ${{ matrix.enable_pytorch && '1' || '0' }}
-          ENABLE_JAX: ${{ matrix.enable_tensorflow && '1' || '0' }}
-          ENABLE_PADDLE: ${{ matrix.enable_paddle && '1' || '0' }}
-        if: ${{ !matrix.check_memleak }}
-      # test ipi
-      - run: |
-          export PATH=${{ github.workspace }}/dp_test/bin:$PATH
-          pytest --cov=deepmd source/ipi/tests
-        env:
-          OMP_NUM_THREADS: 1
-          TF_INTRA_OP_PARALLELISM_THREADS: 1
-          TF_INTER_OP_PARALLELISM_THREADS: 1
-          LD_LIBRARY_PATH: ${{ github.workspace }}/dp_test/lib
-          ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow && '1' || '0' }}
-          ENABLE_PYTORCH: ${{ matrix.enable_pytorch && '1' || '0' }}
-          ENABLE_JAX: ${{ matrix.enable_tensorflow && '1' || '0' }}
-          ENABLE_PADDLE: ${{ matrix.enable_paddle && '1' || '0' }}
-        if: ${{ !matrix.check_memleak }}
-      - name: Upload coverage to Codecov (non-blocking)
-        uses: codecov/codecov-action@v7
-        continue-on-error: true
+        run: source/install/test_cc_local.sh
+      - name: Copy model files to dp_test for downstream
+        run: |
+          mkdir -p dp_test/tests
+          cp -r source/tests/infer dp_test/tests/
+      - name: Upload artifact (dp_test only)
+        uses: actions/upload-artifact@v4
         with:
-          use_oidc: true
-    permissions:
-      id-token: write
+          name: dp-${{ matrix.backend }}-memleak-${{ matrix.memleak }}
+          path: dp_test/
+          retention-days: 1
+
+  # ================================================================
+  # LAMMPS tests (仅 non-memleak)
+  # ================================================================
+  test_lammps:
+    name: LAMMPS (${{ matrix.backend }})
+    needs: buildcc
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: tf_torch
+            enable_tensorflow: TRUE
+            enable_pytorch: TRUE
+            enable_paddle: FALSE
+          - backend: paddle
+            enable_tensorflow: FALSE
+            enable_pytorch: FALSE
+            enable_paddle: TRUE
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: python -m pip install uv
+      - uses: actions/download-artifact@v4
+        with:
+          name: dp-${{ matrix.backend }}-memleak-false
+          path: dp_test/
+      - name: Install Python deps (LAMMPS)
+        run: |
+          if [ "${{ matrix.backend }}" = "tf_torch" ]; then
+            source/install/uv_with_retry.sh pip install --system \
+              --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu \
+              --torch-backend cpu
+            source/install/uv_with_retry.sh pip install --system \
+              -e .[cpu,test,lmp,ipi,jax,torch] mpi4py
+          else
+            source/install/uv_with_retry.sh pip install --system \
+              -e .[cpu,test,lmp,ipi] mpi4py
+            source/install/uv_with_retry.sh pip install --system paddlepaddle
+          fi
+      - name: Run LAMMPS tests
+        run: |
+          export PATH="$PWD/dp_test/bin:$PATH"
+          export LD_LIBRARY_PATH="$PWD/dp_test/lib:$LD_LIBRARY_PATH"
+          export OMP_NUM_THREADS=1
+          export TF_INTRA_OP_PARALLELISM_THREADS=1
+          export TF_INTER_OP_PARALLELISM_THREADS=1
+          pytest source/lmp/tests
+        env:
+          ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow }}
+          ENABLE_PYTORCH: ${{ matrix.enable_pytorch }}
+          ENABLE_JAX: ${{ matrix.enable_tensorflow }}
+          ENABLE_PADDLE: ${{ matrix.enable_paddle }}
+
+  # ================================================================
+  # iPI tests (仅 non-memleak)
+  # ================================================================
+  test_ipi:
+    name: iPI (${{ matrix.backend }})
+    needs: buildcc
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: tf_torch
+            enable_tensorflow: TRUE
+            enable_pytorch: TRUE
+            enable_paddle: FALSE
+          - backend: paddle
+            enable_tensorflow: FALSE
+            enable_pytorch: FALSE
+            enable_paddle: TRUE
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: python -m pip install uv
+      - uses: actions/download-artifact@v4
+        with:
+          name: dp-${{ matrix.backend }}-memleak-false
+          path: dp_test/
+      - name: Install Python deps (iPI)
+        run: |
+          if [ "${{ matrix.backend }}" = "tf_torch" ]; then
+            source/install/uv_with_retry.sh pip install --system \
+              --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu \
+              --torch-backend cpu
+            source/install/uv_with_retry.sh pip install --system \
+              -e .[cpu,test,ipi,jax,torch] i-PI mpi4py
+          else
+            source/install/uv_with_retry.sh pip install --system \
+              -e .[cpu,test,ipi] i-PI mpi4py
+            source/install/uv_with_retry.sh pip install --system paddlepaddle
+          fi
+      - name: Run iPI tests
+        run: |
+          export PATH="$PWD/dp_test/bin:$PATH"
+          export LD_LIBRARY_PATH="$PWD/dp_test/lib:$LD_LIBRARY_PATH"
+          export OMP_NUM_THREADS=1
+          export TF_INTRA_OP_PARALLELISM_THREADS=1
+          export TF_INTER_OP_PARALLELISM_THREADS=1
+          pytest source/ipi/tests
+        env:
+          ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow }}
+          ENABLE_PYTORCH: ${{ matrix.enable_pytorch }}
+          ENABLE_JAX: ${{ matrix.enable_tensorflow }}
+          ENABLE_PADDLE: ${{ matrix.enable_paddle }}
+
+  # ================================================================
+  # Pass gate
+  # ================================================================
   pass:
     name: Pass testing C++
-    needs: [testcc]
+    needs: [buildcc, test_lammps, test_ipi]
     runs-on: ubuntu-slim
     if: always()
     steps:
-      - name: Decide whether the needed jobs succeeded or failed
-        uses: re-actors/alls-green@release/v1
+      - uses: re-actors/alls-green@release/v1
         with:
           jobs: ${{ toJSON(needs) }}
+    permissions:
+      id-token: write
