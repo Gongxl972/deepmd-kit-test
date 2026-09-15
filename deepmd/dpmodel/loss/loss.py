@@ -51,6 +51,11 @@ class Loss(NativeOP, ABC, make_plugin_registry("loss")):
     def label_requirement(self) -> list[DataRequirementItem]:
         """Return data label requirements needed for this loss calculation."""
 
+    @property
+    def supports_ragged_batches(self) -> bool:
+        """Whether this objective accepts a flat per-node batch axis."""
+        return False
+
     @staticmethod
     def display_if_exist(loss: Array, find_property: float) -> Array:
         """Display NaN if labeled property is not found.
@@ -69,10 +74,14 @@ class Loss(NativeOP, ABC, make_plugin_registry("loss")):
         """
         xp = array_api_compat.array_namespace(loss)
         dev = array_api_compat.device(loss)
+        # ``full_like`` passes NaN as a scalar kernel argument, where
+        # ``asarray(xp.nan, device=dev)`` would copy it from the host: a
+        # synchronizing transfer, once per reported quantity per step, on a
+        # value that never changes.
         return xp.where(
             xp.asarray(find_property, dtype=xp.bool, device=dev),
             loss,
-            xp.asarray(xp.nan, device=dev),
+            xp.full_like(loss, xp.nan),
         )
 
     @classmethod

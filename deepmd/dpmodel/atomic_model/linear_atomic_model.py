@@ -182,6 +182,31 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
         """Returns whether the atomic model has message passing."""
         return any(model.has_message_passing() for model in self.models)
 
+    def has_message_passing_across_ranks(self) -> bool:
+        """ANY child needing the exchange makes the composition need it."""
+        return any(m.has_message_passing_across_ranks() for m in self.models)
+
+    def supports_edge_parallel(self) -> bool:
+        """EVERY child must tolerate decomposition; one veto vetoes all."""
+        return all(m.supports_edge_parallel() for m in self.models)
+
+    def dense_lower_supports_comm(self) -> bool:
+        """The shared dense lower is only comm-capable if every child's is."""
+        return all(m.dense_lower_supports_comm() for m in self.models)
+
+    def uses_compact_edge_pairs(self) -> bool:
+        """The export guard fires if ANY child emits compact pairs."""
+        return any(m.uses_compact_edge_pairs() for m in self.models)
+
+    def graph_edge_dtype(self) -> str:
+        """One shared edge tensor: float32 only if EVERY child accepts it."""
+        dtypes = {m.graph_edge_dtype() for m in self.models}
+        return "float32" if dtypes == {"float32"} else "float64"
+
+    def supports_graph_export(self) -> bool:
+        """All children trace into one artifact; each must be exportable."""
+        return all(m.supports_graph_export() for m in self.models)
+
     def need_sorted_nlist_for_lower(self) -> bool:
         """Returns whether the atomic model needs sorted nlist when using `forward_lower`."""
         return True
@@ -277,6 +302,15 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
                 table_stride_2,
                 check_frequency,
             )
+
+    def compression_needs_min_nbor_dist(self) -> bool:
+        """Required as soon as ANY child consumes it.
+
+        The statistic is measured once and handed to every child, so a single
+        child that tabulates from the shortest observed distance keeps the
+        neighbor-statistics pass for the whole composition.
+        """
+        return any(m.compression_needs_min_nbor_dist() for m in self.models)
 
     def uses_graph_lower(self) -> bool:
         """Graph-capable iff EVERY child supports the graph lower.
@@ -698,19 +732,11 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
         """Children that actually consume ``fparam``."""
         return [m for m in self.models if m.get_dim_fparam() > 0]
 
-    def has_default_chg_spin(self) -> bool:
-        """Whether every active child shares one default charge/spin."""
-        return self._agreed_default(
-            self._chg_spin_consumers(),
-            lambda m: m.has_default_chg_spin(),
-            lambda m: m.get_default_chg_spin(),
-        )[0]
-
     def get_default_chg_spin(self) -> "Array | None":
         """The shared default charge/spin conditions, if the children agree."""
         return self._agreed_default(
             self._chg_spin_consumers(),
-            lambda m: m.has_default_chg_spin(),
+            lambda m: m.get_default_chg_spin() is not None,
             lambda m: m.get_default_chg_spin(),
         )[1]
 

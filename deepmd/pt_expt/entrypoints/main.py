@@ -130,12 +130,16 @@ def _build_data_system(
     dataset_params: dict[str, Any],
     type_map: list[str],
     seed: int | None = None,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DeepmdDataSystem | LmdbDataSystem:
     """Build a data system from dataset config, routing LMDB paths to LmdbDataSystem.
 
     A scalar ``systems`` value pointing at an LMDB directory triggers the
     LMDB adapter; otherwise we fall through to the legacy
-    :class:`DeepmdDataSystem` path with system expansion.
+    :class:`DeepmdDataSystem` path with system expansion. ``rank`` and
+    ``world_size`` shard LMDB training batches without changing legacy data
+    systems.
     """
     systems_raw = dataset_params["systems"]
     lmdb_path = _detect_lmdb_path(systems_raw)
@@ -146,6 +150,8 @@ def _build_data_system(
             batch_size=dataset_params["batch_size"],
             auto_prob_style=dataset_params.get("auto_prob"),
             seed=seed,
+            rank=rank,
+            world_size=world_size,
         )
     systems = process_systems(
         systems_raw,
@@ -171,17 +177,26 @@ def get_trainer(
     shared_links: dict | None = None,
 ) -> training.Trainer:
     """Build a :class:`training.Trainer` from a normalised config."""
+    import torch.distributed as dist
+
     training_params = config["training"]
     multi_task = "model_dict" in config["model"]
 
     data_seed = training_params.get("seed", None)
+    is_distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if is_distributed else 0
+    world_size = dist.get_world_size() if is_distributed else 1
 
     def factory(
         task_config: TrainingTaskConfig,
     ) -> tuple[DeepmdDataSystem | LmdbDataSystem, Any | None, StatFileSpec]:
         type_map = list(task_config.model_params["type_map"])
         train_data = _build_data_system(
-            dict(task_config.training_data_params), type_map, seed=data_seed
+            dict(task_config.training_data_params),
+            type_map,
+            seed=data_seed,
+            rank=rank,
+            world_size=world_size,
         )
         validation_data = None
         if task_config.validation_data_params is not None:
@@ -342,7 +357,7 @@ class PTExptTrainEntrypoint(AbstractTrainEntrypoint):
         options: TrainEntrypointOptions,
         *,
         multi_task: bool,
-    ) -> tuple[dict[str, Any], None]:
+    ) -> tuple[dict[str, Any], float | dict[str, float | None] | None]:
         """Update pt_expt descriptor selections from neighbor statistics."""
         log.info(
             "Calculate neighbor statistics... "
@@ -352,19 +367,23 @@ class PTExptTrainEntrypoint(AbstractTrainEntrypoint):
             BaseModel,
         )
 
+        min_nbor_dist: dict[str, float | None] = {}
         for task_config in iter_training_task_configs(config):
             type_map = task_config.model_params.get("type_map")
             train_data = _get_neighbor_stat_data(
                 dict(task_config.training_data_params), type_map
             )
-            updated_model_params, _ = BaseModel.update_sel(
+            updated_model_params, task_min_nbor_dist = BaseModel.update_sel(
                 train_data, type_map, dict(task_config.model_params)
             )
+            min_nbor_dist[task_config.key] = task_min_nbor_dist
             if multi_task:
                 config["model"]["model_dict"][task_config.key] = updated_model_params
             else:
                 config["model"] = updated_model_params
-        return config, None
+        if multi_task:
+            return config, min_nbor_dist
+        return config, next(iter(min_nbor_dist.values()), None)
 
     def print_summary(self) -> None:
         """Print pt_expt backend summary."""
@@ -414,6 +433,13 @@ class PTExptTrainEntrypoint(AbstractTrainEntrypoint):
             finetune_links=self.finetune_links,
             shared_links=self.shared_links,
         )
+        # Persist the neighbor statistic on the model so that `dp compress`
+        # reads it from the checkpoint instead of rescanning the training data.
+        if isinstance(neighbor_stat, dict):
+            for task_key, task_min_nbor_dist in neighbor_stat.items():
+                trainer.model[task_key].min_nbor_dist = task_min_nbor_dist
+        elif neighbor_stat is not None:
+            trainer.model.min_nbor_dist = neighbor_stat
         trainer.run()
 
 

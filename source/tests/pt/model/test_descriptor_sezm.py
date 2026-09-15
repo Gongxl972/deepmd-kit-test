@@ -85,6 +85,23 @@ def _tiny_two_atom_system(
     return coord, atype, nlist
 
 
+def _spin_edge_system(
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A two-atom edge system with one magnetic and one non-magnetic atom."""
+    coord = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=dtype, device=device
+    ).view(1, -1, 3)
+    atype = torch.tensor([[0, 1]], dtype=torch.int64, device=device)
+    edge_index = torch.tensor([[1, 0], [0, 1]], dtype=torch.long, device=device)
+    edge_vec = torch.tensor(
+        [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=dtype, device=device
+    )
+    edge_mask = torch.ones(2, dtype=torch.bool, device=device)
+    return coord, atype, edge_index, edge_vec, edge_mask
+
+
 def _descriptor_kwargs(**overrides) -> dict:
     """Build a compact SeZM descriptor config for tests."""
     kwargs = {
@@ -175,36 +192,44 @@ class TestDescrptSeZM(_SeZMTestCase):
         self.assertTrue(torch.all(torch.isfinite(extended_coord.grad)))
         return model
 
-    def test_amp_infer_env_controls_eval_autocast(self) -> None:
-        """Inference AMP is sampled from env and still gated by ``use_amp``."""
-        with mock.patch.dict(os.environ, {"DP_AMP_INFER": "1"}, clear=False):
-            enabled_model = DescrptSeZM(**_descriptor_kwargs(use_amp=True))
-            disabled_model = DescrptSeZM(**_descriptor_kwargs(use_amp=False))
+    def test_train_and_eval_amp_switches_are_independent(self) -> None:
+        """Training follows ``use_amp``, evaluation follows ``DP_AMP_INFER``.
 
-        enabled_model.eval()
-        disabled_model.eval()
+        Neither switch may leak into the other's mode: mixed precision at
+        inference is a throughput choice that must not require the model to
+        have been trained with it, and a model trained under AMP must still
+        deploy at full precision.
+        """
+        models = {}
+        for amp_infer in (False, True):
+            with mock.patch.dict(
+                os.environ, {"DP_AMP_INFER": "1" if amp_infer else "0"}, clear=False
+            ):
+                for use_amp in (False, True):
+                    models[amp_infer, use_amp] = DescrptSeZM(
+                        **_descriptor_kwargs(use_amp=use_amp)
+                    )
 
-        with mock.patch("torch.autocast", return_value=nullcontext()) as autocast_mock:
-            with enabled_model._compute_mode_ctx(torch.device("cuda")):
-                pass
-        autocast_mock.assert_called_once_with(
-            device_type="cuda",
-            dtype=torch.bfloat16,
-            enabled=True,
-        )
-
-        with mock.patch("torch.autocast", return_value=nullcontext()) as autocast_mock:
-            with disabled_model._compute_mode_ctx(torch.device("cuda")):
-                pass
-        autocast_mock.assert_not_called()
-
-        with mock.patch.dict(os.environ, {"DP_AMP_INFER": "0"}, clear=False):
-            default_model = DescrptSeZM(**_descriptor_kwargs(use_amp=True))
-        default_model.eval()
-        with mock.patch("torch.autocast", return_value=nullcontext()) as autocast_mock:
-            with default_model._compute_mode_ctx(torch.device("cuda")):
-                pass
-        autocast_mock.assert_not_called()
+        for (amp_infer, use_amp), model in models.items():
+            for training in (False, True):
+                expected = use_amp if training else amp_infer
+                with self.subTest(
+                    amp_infer=amp_infer, use_amp=use_amp, training=training
+                ):
+                    model.train(training)
+                    with mock.patch(
+                        "torch.autocast", return_value=nullcontext()
+                    ) as autocast_mock:
+                        with model._compute_mode_ctx(torch.device("cuda")):
+                            pass
+                    if expected:
+                        autocast_mock.assert_called_once_with(
+                            device_type="cuda",
+                            dtype=torch.bfloat16,
+                            enabled=True,
+                        )
+                    else:
+                        autocast_mock.assert_not_called()
 
     def test_cartesian_config_wiring(self) -> None:
         """Each Cartesian/mixing config builds the intended submodules.
@@ -329,6 +354,125 @@ class TestDescrptSeZM(_SeZMTestCase):
                 )
                 self.assertEqual(desc.shape, (1, 2, 4))
                 self.assertTrue(torch.all(torch.isfinite(desc)))
+
+    def test_so3_readout_scalar_path_matches_full_output(self) -> None:
+        """The scalar-specialized final FFN matches slicing its full output."""
+        dtype = torch.float64
+        for readout in ("glu", "mlp"):
+            with self.subTest(so3_readout=readout):
+                descriptor = DescrptSeZM(
+                    **_descriptor_kwargs(
+                        l_schedule=[2, 2],
+                        kmax=1,
+                        so3_readout=readout,
+                        precision="float64",
+                        use_amp=False,
+                        seed=19,
+                    )
+                )
+                ffn = descriptor.output_ffn
+                generator = torch.Generator(device=self.device).manual_seed(23)
+                with torch.no_grad():
+                    for parameter in ffn.parameters():
+                        parameter.add_(
+                            torch.randn(
+                                parameter.shape,
+                                dtype=parameter.dtype,
+                                device=parameter.device,
+                                generator=generator,
+                            )
+                            * 0.1
+                        )
+
+                shape = (3, descriptor.node_readout_dim, 1, descriptor.channels)
+                full_input = torch.randn(
+                    shape,
+                    dtype=dtype,
+                    device=self.device,
+                    generator=generator,
+                    requires_grad=True,
+                )
+                scalar_input = full_input.detach().clone().requires_grad_(True)
+                probe = torch.randn(
+                    (3, 1, 1, descriptor.channels),
+                    dtype=dtype,
+                    device=self.device,
+                    generator=generator,
+                )
+
+                full = ffn(full_input)[:, 0:1, :, :]
+                scalar = ffn.forward_scalar(scalar_input)
+                torch.testing.assert_close(full, scalar, atol=1e-12, rtol=1e-12)
+
+                parameters = tuple(ffn.parameters())
+                full_grads = torch.autograd.grad(
+                    torch.sum(full * probe),
+                    (full_input, *parameters),
+                    allow_unused=True,
+                    create_graph=True,
+                )
+                scalar_grads = torch.autograd.grad(
+                    torch.sum(scalar * probe),
+                    (scalar_input, *parameters),
+                    allow_unused=True,
+                    create_graph=True,
+                )
+                for full_grad, scalar_grad in zip(
+                    full_grads, scalar_grads, strict=True
+                ):
+                    self.assertEqual(full_grad is None, scalar_grad is None)
+                    if full_grad is not None:
+                        torch.testing.assert_close(
+                            full_grad,
+                            scalar_grad,
+                            atol=1e-12,
+                            rtol=1e-12,
+                        )
+
+                tangents = tuple(
+                    None
+                    if grad is None
+                    else torch.randn(
+                        grad.shape,
+                        dtype=grad.dtype,
+                        device=grad.device,
+                        generator=generator,
+                    )
+                    for grad in full_grads
+                )
+                full_grad_probe = sum(
+                    torch.sum(grad * tangent)
+                    for grad, tangent in zip(full_grads, tangents, strict=True)
+                    if grad is not None and grad.requires_grad
+                )
+                scalar_grad_probe = sum(
+                    torch.sum(grad * tangent)
+                    for grad, tangent in zip(scalar_grads, tangents, strict=True)
+                    if grad is not None and grad.requires_grad
+                )
+                full_second_grads = torch.autograd.grad(
+                    full_grad_probe,
+                    (full_input, *parameters),
+                    allow_unused=True,
+                )
+                scalar_second_grads = torch.autograd.grad(
+                    scalar_grad_probe,
+                    (scalar_input, *parameters),
+                    allow_unused=True,
+                )
+                for full_grad, scalar_grad in zip(
+                    full_second_grads,
+                    scalar_second_grads,
+                    strict=True,
+                ):
+                    self.assertEqual(full_grad is None, scalar_grad is None)
+                    if full_grad is not None:
+                        torch.testing.assert_close(
+                            full_grad,
+                            scalar_grad,
+                            atol=1e-12,
+                            rtol=1e-12,
+                        )
 
     def test_zero_block_descriptor(self) -> None:
         """``n_blocks=0`` builds the interaction-free descriptor end to end.
@@ -915,23 +1059,6 @@ class TestDescrptSeZM(_SeZMTestCase):
 class TestSeZMSpinEmbedding(_SeZMTestCase):
     """Test the native per-atom spin embedding and its descriptor injection."""
 
-    def _spin_edges(
-        self, dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """A two-atom edge system with one magnetic and one non-magnetic atom."""
-        coord = torch.tensor(
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=dtype, device=self.device
-        ).view(1, -1, 3)
-        atype = torch.tensor([[0, 1]], dtype=torch.int64, device=self.device)
-        edge_index = torch.tensor(
-            [[1, 0], [0, 1]], dtype=torch.long, device=self.device
-        )
-        edge_vec = torch.tensor(
-            [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=dtype, device=self.device
-        )
-        edge_mask = torch.ones(2, dtype=torch.bool, device=self.device)
-        return coord, atype, edge_index, edge_vec, edge_mask
-
     def test_cart_to_l1_intertwines_wigner_rotation(self) -> None:
         """The l=1 spin map must rotate with the descriptor's Wigner-D block."""
         dtype = torch.float64
@@ -1041,7 +1168,9 @@ class TestSeZMSpinEmbedding(_SeZMTestCase):
         the backbone branch carries the on-site and neighbor-aggregated l=1.
         """
         dtype = torch.float64
-        coord, atype, edge_index, edge_vec, edge_mask = self._spin_edges(dtype)
+        coord, atype, edge_index, edge_vec, edge_mask = _spin_edge_system(
+            self.device, dtype
+        )
         spin = torch.zeros(1, 2, 3, dtype=dtype, device=self.device)
         spin[0, 0] = torch.tensor([0.3, -0.7, 0.5], dtype=dtype, device=self.device)
         quat = _random_quaternion(1, device=self.device, dtype=dtype)
@@ -1094,6 +1223,175 @@ class TestSeZMSpinEmbedding(_SeZMTestCase):
                     spin=torch.zeros_like(spin),
                 )
                 self.assertFalse(torch.allclose(desc, desc_zero, atol=1e-6))
+
+
+class TestSeZMEnvSeedSpinGate(_SeZMTestCase):
+    """The env-seed spin gate: placement, zero point and version migration."""
+
+    def _kwargs(self) -> dict:
+        """Config of a spin descriptor with the env-seed route enabled."""
+        return _descriptor_kwargs(
+            precision="float64",
+            use_spin=[True, False],
+            use_env_seed=True,
+            seed=7,
+        )
+
+    def _descriptor(self) -> DescrptSeZM:
+        """A spin descriptor with non-route weights moved off initialization.
+
+        The env-seed output projection is zero-initialized, so an unperturbed
+        descriptor is insensitive to the environment matrix. The four
+        output-controlling spin routes stay at zero so the tests exercise the
+        same starting point used by a fresh or migrated spin-free model.
+        """
+        model = DescrptSeZM(**self._kwargs())
+        spin_routes = {
+            "spin_embedding.mag_layer2.matrix",
+            "spin_embedding.adam_spin_vec_weight",
+            "spin_embedding.adam_spin_nbr_weight",
+            "env_seed_embedding.spin_scale",
+        }
+        torch.manual_seed(0)
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if name not in spin_routes:
+                    parameter.copy_(torch.randn_like(parameter) * 0.1)
+        model.eval()
+        return model
+
+    def _inputs(self) -> tuple[dict, torch.Tensor]:
+        """Edge-route keyword arguments and a spin on the magnetic atom."""
+        dtype = torch.float64
+        coord, atype, edge_index, edge_vec, edge_mask = _spin_edge_system(
+            self.device, dtype
+        )
+        spin = torch.zeros(1, 2, 3, dtype=dtype, device=self.device)
+        spin[0, 0] = torch.tensor([0.3, -0.7, 0.5], dtype=dtype, device=self.device)
+        return {
+            "extended_coord": coord,
+            "extended_atype": atype,
+            "edge_index": edge_index,
+            "edge_vec": edge_vec,
+            "edge_mask": edge_mask,
+        }, spin
+
+    def test_zero_gate_receives_a_gradient(self) -> None:
+        """A zero gate is a starting point, not a fixed point.
+
+        The gate multiplies the spin block of the environment matrix after
+        the quadratic form, so the descriptor is LINEAR in it and its
+        gradient at zero is that block. A pre-quadratic amplitude would carry
+        a gradient proportional to itself and could never leave zero, which
+        is why the gate sits where it does.
+        """
+        model = self._descriptor()
+        kwargs, spin = self._inputs()
+        desc, _ = model.forward_with_edges(**kwargs, spin=spin)
+        desc.sum().backward()
+        gate_grad = model.env_seed_embedding.spin_scale.grad
+        self.assertIsNotNone(gate_grad)
+        self.assertGreater(float(gate_grad.abs().max()), 1e-8)
+
+    def test_gate_placement_differs_from_the_legacy_one_by_a_square(self) -> None:
+        """The version-1.2 gate ``a**2`` is the version-1.1 amplitude ``a``.
+
+        The amplitude scaled the neighbor-spin channel, which enters the
+        environment matrix linearly, so the legacy forward is reproduced by a
+        unit gate on a spin scaled by ``a``. With the remaining spin routes
+        reset, the env-seed gate is the only difference between the two.
+        """
+        model = self._descriptor()
+        kwargs, spin = self._inputs()
+        amplitude = 2.0
+        with torch.no_grad():
+            model.env_seed_embedding.spin_scale.fill_(amplitude**2)
+        migrated, _ = model.forward_with_edges(**kwargs, spin=spin)
+        with torch.no_grad():
+            model.env_seed_embedding.spin_scale.fill_(1.0)
+        legacy, _ = model.forward_with_edges(**kwargs, spin=amplitude * spin)
+        torch.testing.assert_close(migrated, legacy, atol=1e-12, rtol=1e-12)
+
+    def test_loading_a_legacy_state_squares_the_gate(self) -> None:
+        """A version-1.1 state is retagged 1.2 with its gate squared.
+
+        The gate is a CHILD parameter, so the migration has to rewrite the
+        incoming state: the descriptor's own buffers load before torch
+        descends into ``env_seed_embedding``, and a migration applied to the
+        live parameter would be overwritten by that descent.
+        """
+        state = self._descriptor().state_dict()
+        state["version_tensor"] = torch.full_like(state["version_tensor"], 1.1)
+        state["env_seed_embedding.spin_scale"] = torch.full_like(
+            state["env_seed_embedding.spin_scale"], 2.0
+        )
+        model = DescrptSeZM(**self._kwargs())
+        model.load_state_dict(state)
+        torch.testing.assert_close(
+            model.env_seed_embedding.spin_scale.detach(),
+            torch.full_like(model.env_seed_embedding.spin_scale, 4.0),
+        )
+        self.assertEqual(model.version, 1.2)
+        self.assertEqual(float(model.version_tensor.item()), 1.2)
+
+    def test_loading_legacy_spin_free_state_zeros_dormant_routes(self) -> None:
+        kwargs = {**self._kwargs(), "use_spin": [False, False]}
+        state = DescrptSeZM(**kwargs).state_dict()
+        state["version_tensor"] = torch.full_like(state["version_tensor"], 1.1)
+        dormant_keys = (
+            "spin_embedding.mag_layer2.matrix",
+            "spin_embedding.adam_spin_vec_weight",
+            "spin_embedding.adam_spin_nbr_weight",
+            "env_seed_embedding.spin_scale",
+        )
+        for key in dormant_keys:
+            state[key] = torch.full_like(state[key], 3.0)
+        state["spin_embedding.mag_layer1.matrix"] = torch.full_like(
+            state["spin_embedding.mag_layer1.matrix"], 5.0
+        )
+
+        model = DescrptSeZM(**kwargs)
+        model.load_state_dict(state)
+
+        migrated = model.state_dict()
+        for key in dormant_keys:
+            torch.testing.assert_close(migrated[key], torch.zeros_like(migrated[key]))
+        torch.testing.assert_close(
+            migrated["spin_embedding.mag_layer1.matrix"],
+            torch.full_like(migrated["spin_embedding.mag_layer1.matrix"], 5.0),
+        )
+        self.assertEqual(model.version, 1.2)
+
+    def test_a_migrated_state_is_migrated_only_once(self) -> None:
+        """Re-saving a migrated descriptor advertises 1.2, so a reload is inert."""
+        state = self._descriptor().state_dict()
+        state["version_tensor"] = torch.full_like(state["version_tensor"], 1.1)
+        state["env_seed_embedding.spin_scale"] = torch.full_like(
+            state["env_seed_embedding.spin_scale"], 2.0
+        )
+        migrated = DescrptSeZM(**self._kwargs())
+        migrated.load_state_dict(state)
+        reloaded = DescrptSeZM(**self._kwargs())
+        reloaded.load_state_dict(migrated.state_dict())
+        torch.testing.assert_close(
+            reloaded.env_seed_embedding.spin_scale.detach(),
+            torch.full_like(reloaded.env_seed_embedding.spin_scale, 4.0),
+        )
+        self.assertEqual(reloaded.version, 1.2)
+
+    def test_serialize_roundtrip_migrates_a_legacy_payload(self) -> None:
+        """The dp-format path shares the rule with the state-dict path."""
+        data = self._descriptor().serialize()
+        data["@version"] = 1.1
+        data["@variables"]["env_seed_embedding.spin_scale"] = (
+            0.0 * data["@variables"]["env_seed_embedding.spin_scale"] + 3.0
+        )
+        model = DescrptSeZM.deserialize(data)
+        torch.testing.assert_close(
+            model.env_seed_embedding.spin_scale.detach(),
+            torch.full_like(model.env_seed_embedding.spin_scale, 9.0),
+        )
+        self.assertEqual(model.version, 1.2)
 
 
 class TestBuildEdgeQuaternion(_SeZMTestCase):
@@ -2048,8 +2346,19 @@ class TestEdgeNorm(_SeZMTestCase):
                     torch.testing.assert_close(mlp(x), restored(x))
 
     def test_edge_norm_gates_all_cutoff_vanishing_norms(self) -> None:
-        """``edge_norm`` controls every cutoff-vanishing normalization path."""
-        for edge_norm in (True, False):
+        """``edge_norm`` controls every cutoff-vanishing normalization path.
+
+        A bool switches the radial, FiLM and focus norms together; a list of
+        three bools ``[radial, film, focus]`` switches them individually. The
+        post-SO(2) residual scaling follows the radial switch.
+        """
+        cases = [
+            (True, (True, True, True)),
+            (False, (False, False, False)),
+            ([False, True, False], (False, True, False)),
+            ([True, False, True], (True, False, True)),
+        ]
+        for edge_norm, (radial_on, film_on, focus_on) in cases:
             with self.subTest(edge_norm=edge_norm):
                 desc = DescrptSeZM(
                     **_descriptor_kwargs(
@@ -2064,26 +2373,84 @@ class TestEdgeNorm(_SeZMTestCase):
                 radial_has_norm = any(
                     type(m).__name__ == "RMSNorm" for m in desc.radial_embedding.net
                 )
-                self.assertEqual(radial_has_norm, edge_norm)
+                self.assertEqual(radial_has_norm, radial_on)
                 # env-seed FiLM scale/shift norms
                 self.assertEqual(
-                    type(desc.film_scale_norm).__name__ == "ScalarRMSNorm", edge_norm
+                    type(desc.film_scale_norm).__name__ == "ScalarRMSNorm", film_on
                 )
                 self.assertEqual(
-                    type(desc.film_shift_norm).__name__ == "ScalarRMSNorm", edge_norm
+                    type(desc.film_shift_norm).__name__ == "ScalarRMSNorm", film_on
                 )
                 # cross-focus competition norm (n_focus>1 -> competition active)
                 focus_norm_mod = desc.blocks[0].so2_conv.focus_compete_norm
                 self.assertEqual(
-                    type(focus_norm_mod).__name__ == "ScalarRMSNorm", edge_norm
+                    type(focus_norm_mod).__name__ == "ScalarRMSNorm", focus_on
                 )
-                # Only the post-SO(2) residual branch uses unit-floor scaling.
-                expected_eps = 1.0e-5 if edge_norm else 1.0
+                # Only the post-SO(2) residual branch uses unit-floor scaling,
+                # bound to the radial switch.
+                expected_eps = 1.0e-5 if radial_on else 1.0
                 self.assertEqual(desc.blocks[0].post_so2_norm.eps, expected_eps)
                 self.assertEqual(desc.blocks[0].pre_so2_norm.eps, 1.0e-5)
                 self.assertEqual(desc.blocks[0].pre_ffn_norms[0].eps, 1.0e-5)
                 self.assertEqual(desc.blocks[0].post_ffn_norms[0].eps, 1.0e-5)
-                self.assertEqual(desc.serialize()["config"]["edge_norm"], edge_norm)
+                canonical = [radial_on, film_on, focus_on]
+                self.assertEqual(desc.serialize()["config"]["edge_norm"], canonical)
+                restored = DescrptSeZM.deserialize(desc.serialize())
+                self.assertEqual(
+                    [
+                        restored.radial_norm,
+                        restored.film_norm,
+                        restored.focus_norm,
+                    ],
+                    canonical,
+                )
+
+    def test_edge_norm_legacy_checkpoint_formats(self) -> None:
+        """Serialized data from older checkpoints loads unchanged.
+
+        The oldest checkpoints predate the ``edge_norm`` option and carry no
+        such config key (the norms were always built, matching the default
+        ``True``); intermediate checkpoints store a plain bool. Both must
+        deserialize into the same module structure and reproduce the source
+        model's output exactly.
+        """
+        dtype = PRECISION_DICT["float64"]
+        cases = [
+            ("missing_key", True, None, (True, True, True)),
+            ("bool_true", True, True, (True, True, True)),
+            ("bool_false", False, False, (False, False, False)),
+        ]
+        for case_name, build_edge_norm, stored_edge_norm, expected in cases:
+            with self.subTest(case=case_name):
+                model = DescrptSeZM(
+                    **_descriptor_kwargs(
+                        edge_norm=build_edge_norm,
+                        use_env_seed=True,
+                        n_focus=2,
+                        precision="float64",
+                    )
+                )
+                data = model.serialize()
+                if stored_edge_norm is None:
+                    data["config"].pop("edge_norm")
+                else:
+                    data["config"]["edge_norm"] = stored_edge_norm
+                restored = DescrptSeZM.deserialize(data)
+                self.assertEqual(
+                    (
+                        restored.radial_norm,
+                        restored.film_norm,
+                        restored.focus_norm,
+                    ),
+                    expected,
+                )
+                coord, atype, nlist = _tiny_two_atom_system(self.device, dtype=dtype)
+                extended_coord = coord.reshape(1, -1)
+                desc1, _, _, _, sw1 = model(extended_coord, atype, nlist)
+                desc2, _, _, _, sw2 = restored(extended_coord, atype, nlist)
+                atol, rtol = _forward_tols(dtype)
+                torch.testing.assert_close(desc1, desc2, atol=atol, rtol=rtol)
+                torch.testing.assert_close(sw1, sw2, atol=atol, rtol=rtol)
 
 
 class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):

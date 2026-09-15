@@ -41,6 +41,12 @@ class LinearEnergyModel(DPModelCommon, DPLinearModel_):
     # identical for any energy model -- reuse EnergyModel's verbatim so
     # compositions (e.g. analytical bridging) freeze like standard models.
     forward_lower_graph_exportable = EnergyModel.forward_lower_graph_exportable
+    # Same ownership for the with-comm twin: it is the SAME energy contract
+    # plus the border-exchange inputs, so a bridged composition gets the
+    # multi-rank artifact through the same alias (issue #5906).
+    forward_lower_graph_exportable_with_comm = (
+        EnergyModel.forward_lower_graph_exportable_with_comm
+    )
 
     def __init__(
         self,
@@ -218,6 +224,9 @@ class LinearEnergyModel(DPModelCommon, DPLinearModel_):
         type_map = local_jdata_cpy["type_map"]
         min_nbor_dist = None
         for idx, sub_model in enumerate(local_jdata_cpy["models"]):
+            if sub_model.get("type") == "inner_potential":
+                # analytical child: no descriptor, no selection to update
+                continue
             if "tab_file" not in sub_model:
                 sub_model, temp_min = DPModelCommon.update_sel(
                     train_data, type_map, local_jdata_cpy["models"][idx]

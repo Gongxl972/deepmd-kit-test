@@ -35,6 +35,7 @@ from __future__ import (
     annotations,
 )
 
+import functools
 import math
 from typing import (
     TYPE_CHECKING,
@@ -71,6 +72,9 @@ from deepmd.dpmodel.utils.seed import (
 )
 from deepmd.dpmodel.utils.update_sel import (
     UpdateSel,
+)
+from deepmd.utils.charge_state import (
+    validate_charge_state,
 )
 from deepmd.utils.version import (
     check_version_compatibility,
@@ -317,14 +321,16 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         Hidden layer sizes for radial networks. An output layer of size
         `(l_schedule[0]+extra_node_l+1)*channels` will be automatically appended.
     edge_norm
-        Whether to apply channel RMSNorm on the descriptor's cutoff-vanishing
-        branches: the radial network hidden layers, the environment-seed FiLM
-        scale/shift logits, the cross-focus competition scalars, and the
-        post-SO(2) residual messages. ``False`` replaces the first three norms
-        with identity and changes only the post-SO(2) norm to unit-floor residual
-        scaling. The unit floor uses ``sqrt(1 + variance)`` so small messages
-        retain their cutoff envelope instead of receiving the standard
-        ``1/sqrt(eps)`` small-signal gain.
+        Channel RMSNorm on the descriptor's cutoff-vanishing branches: the
+        radial network hidden layers, the environment-seed FiLM scale/shift
+        logits, and the cross-focus competition scalars. A bool switches all
+        three together; a list of three bools ``[radial, film, focus]``
+        switches them individually. Disabled norms are identity
+        pass-throughs. The post-SO(2) residual scaling follows the ``radial``
+        entry: with it disabled the norm uses the unit floor
+        ``sqrt(1 + variance)``, so small messages retain their cutoff
+        envelope instead of receiving the standard ``1/sqrt(eps)``
+        small-signal gain.
     use_env_seed
         If True, seed the initial node state with local-environment information:
         apply environment matrix FiLM conditioning on l=0 features using 4D
@@ -594,7 +600,7 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
     """
 
     _ENV_DIM: int = 1  # Use se_r style (radial only) for EnvMatStatSe compatibility
-    LATEST_VERSION: float = 1.1
+    LATEST_VERSION: float = 1.2
 
     def __init__(
         self,
@@ -606,7 +612,7 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         basis_type: str = "bessel",
         n_radial: int = 16,
         radial_mlp: list[int] | None = None,
-        edge_norm: bool = True,
+        edge_norm: bool | list[bool] = True,
         use_env_seed: bool = True,
         random_gamma: bool = True,
         edge_cartesian: bool = False,
@@ -702,7 +708,22 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         if radial_mlp is None:
             radial_mlp = [0]
         self.radial_mlp = [self.channels if x == 0 else int(x) for x in radial_mlp]
-        self.edge_norm = bool(edge_norm)
+        if isinstance(edge_norm, bool):
+            self.radial_norm = edge_norm
+            self.film_norm = edge_norm
+            self.focus_norm = edge_norm
+        elif (
+            isinstance(edge_norm, (list, tuple))
+            and len(edge_norm) == 3
+            and all(isinstance(v, bool) for v in edge_norm)
+        ):
+            self.radial_norm = bool(edge_norm[0])
+            self.film_norm = bool(edge_norm[1])
+            self.focus_norm = bool(edge_norm[2])
+        else:
+            raise ValueError(
+                "edge_norm must be a bool or a list[bool] of length 3: [radial, film, focus]"
+            )
         if sandwich_norm is None:
             sandwich_norm = [False, True, True, False]
         if not isinstance(sandwich_norm, (list, tuple)) or len(sandwich_norm) != 4:
@@ -783,10 +804,10 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         self.edge_cartesian = bool(edge_cartesian)
         self.node_cartesian = str(node_cartesian)
         self.add_chg_spin_ebd = bool(add_chg_spin_ebd)
-        if default_chg_spin is not None and len(default_chg_spin) != 2:
-            raise ValueError("`default_chg_spin` must contain [charge, spin].")
         self.default_chg_spin = (
-            None if default_chg_spin is None else [float(x) for x in default_chg_spin]
+            None
+            if default_chg_spin is None
+            else validate_charge_state(default_chg_spin)
         )
 
         # === Native per-atom spin embedding ===
@@ -1005,7 +1026,7 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
             # vanishes at rcut; normalizing them shares the radial network's
             # cutoff-smoothness issue, so ``edge_norm=False`` also drops these
             # norms (identity pass-through) to keep the FiLM scale/shift smooth.
-            if self.edge_norm:
+            if self.film_norm:
                 self.film_scale_norm = ScalarRMSNorm(
                     channels=self.channels,
                     n_focus=1,
@@ -1062,7 +1083,7 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
             activation_function=self.activation_function,
             precision=self.compute_precision,  # force fp32+
             trainable=self.trainable,
-            radial_norm=self.edge_norm,
+            radial_norm=self.radial_norm,
             seed=seed_radial_embedding,
         )
 
@@ -1125,7 +1146,7 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
                     channels=self.channels,
                     n_focus=self.n_focus,
                     focus_dim=self.focus_dim,
-                    focus_norm=self.edge_norm,
+                    focus_norm=self.focus_norm,
                     so2_norm=self.so2_norm,
                     mixing_layers=self.mixing_layers,
                     so2_attn_res=self.so2_attn_res_mode,
@@ -1160,7 +1181,7 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
                     atten_o_proj=self.use_atten_o_proj,
                     so2_pre_norm=self.so2_pre_norm,
                     so2_post_norm=self.so2_post_norm,
-                    so2_post_norm_eps=1.0e-5 if self.edge_norm else 1.0,
+                    so2_post_norm_eps=1.0e-5 if self.radial_norm else 1.0,
                     so2_activation_function=self.so2_activation_function,
                     ffn_pre_norm=self.ffn_pre_norm,
                     ffn_post_norm=self.ffn_post_norm,
@@ -1174,6 +1195,14 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
                 )
             )
         self.blocks = blocks
+
+        # Accelerated backends may replace the distance-to-radial chain and the
+        # packed Wigner-D construction. The array-API reference leaves these
+        # hooks unbound and always retains the dense Wigner matrices.
+        self._cuda_radial_fn = None
+        self._cuda_wigner_fn = None
+        self._wigner_free_conv = False
+        self._packed_wigner_train = False
 
         # === Optional descriptor-level attention residuals ===
         self.final_block_attn_res = None
@@ -1541,7 +1570,16 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
                 type_ebed, spin, atype_flat, n_nodes=n_nodes
             )
 
+        # Cross-rank SFPG completion (issue #5906): only a bridged model
+        # under domain decomposition needs it -- the gate's src-keyed
+        # per-node partials are rank-incomplete then.
+        node_partial_exchange = None
+        if comm_dict is not None and self.bridging_switch is not None:
+            node_partial_exchange = functools.partial(
+                self._gate_partial_exchange, comm_dict=comm_dict
+            )
         # === Step 3. Build edge cache once (sparse edges) ===
+        training = self._in_training_mode()
         edge_cache = _edge_cache_from_arrays(
             type_ebed=type_ebed,
             edge_index=edge_index,
@@ -1554,14 +1592,14 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
             bridging_switch=self.bridging_switch,
             edge_envelope=self.edge_envelope,
             radial_basis=self.radial_basis,
+            fused_radial=None if training else self._cuda_radial_fn,
+            fused_wigner=None if training else self._cuda_wigner_fn,
             # Random local-Z roll is a training-only augmentation; the model
-            # is roll-equivariant, so inference fixes gamma. Mirrors pt's
-            # ``random_gamma=self.random_gamma and self.training`` via the
-            # ``_in_training_mode`` runtime hook (False here; the pt_expt
-            # wrapper overrides it with the torch module's training flag).
-            random_gamma=self.random_gamma and self._in_training_mode(),
+            # is roll-equivariant, so inference fixes gamma.
+            random_gamma=self.random_gamma and training,
             wigner_calc=self.wigner_calc,
-            build_wigner=self._need_full_wigner,
+            build_wigner=self._build_full_wigner(),
+            node_partial_exchange=node_partial_exchange,
         )
 
         ebed_dim_0 = self.node_init_dim  # (node_init_lmax+1)^2
@@ -1597,10 +1635,10 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
             scale_logits = film[:, : self.channels]  # (N, C)
             shift_logits = film[:, self.channels :]  # (N, C)
             scale_hat = (
-                self.film_scale_norm(scale_logits) if self.edge_norm else scale_logits
+                self.film_scale_norm(scale_logits) if self.film_norm else scale_logits
             )  # (N, C)
             shift_hat = (
-                self.film_shift_norm(shift_logits) if self.edge_norm else shift_logits
+                self.film_shift_norm(shift_logits) if self.film_norm else shift_logits
             )  # (N, C)
             scale_strength = xp.exp(
                 xp_asarray_nodetach(
@@ -1859,7 +1897,9 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
             )
         for layer in self.readout_pre_layers:
             x_ro = x_ro + layer(x_ro)
-        return (x_ro + self.output_ffn(x_ro))[:, 0:1, :, :]
+        if self.so3_readout == "none":
+            return (x_ro + self.output_ffn(x_ro))[:, 0:1, :, :]
+        return x_ro[:, 0:1, :, :] + self.output_ffn.call_scalar(x_ro)
 
     def _edge_quaternion(self, edge_cache: EdgeCache) -> Array:
         """
@@ -1886,6 +1926,45 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
             )
         return edge_quat
 
+    def _build_full_wigner(self) -> bool:
+        """Return whether the active execution path needs dense Wigner blocks."""
+        if not self._need_full_wigner:
+            return False
+        if self._in_training_mode():
+            return not self._packed_wigner_train
+        return not self._wigner_free_conv
+
+    def _shared_wigner_runs(
+        self,
+        edge_cache: EdgeCache,
+        lmax: int,
+    ) -> Array | None:
+        """
+        Zonal coupling taken from the packed runs the convolution already builds.
+
+        The fused convolution stages a packed block-diagonal Wigner run per
+        edge whose degree-``l`` ``m = 0`` row occupies entries ``l ** 2`` to
+        ``(l + 1) ** 2``. That is the same quantity as
+        ``Dt_full[:, row(l, m), col(l, 0)]``, so degrees ``1..lmax`` are one
+        contiguous slice and the rotation algebra runs once per step instead of
+        twice. The runs are cached on the edge cache, so whichever consumer
+        comes first pays for them.
+
+        Parameters
+        ----------
+        edge_cache : EdgeCache
+            The step's edge feature cache.
+        lmax : int
+            Highest degree the coupling must cover.
+
+        Returns
+        -------
+        Array or None
+            Coupling with shape ``(E, (lmax + 1) ** 2 - 1)``, or ``None`` when
+            no convolution supplies runs of at least this degree.
+        """
+        return None
+
     def _build_gie_zonal_coupling(
         self,
         edge_cache: EdgeCache,
@@ -1904,6 +1983,9 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         """
         if edge_cache.Dt_full is None:
             calc = self.gie_zonal_wigner_calc or self.wigner_calc
+            shared = self._shared_wigner_runs(edge_cache, calc.lmax)
+            if shared is not None:
+                return shared
             return calc.forward_zonal(self._edge_quaternion(edge_cache), lmin=1)
         if self.gie_zonal_wigner_calc is None:
             return None
@@ -2176,7 +2258,7 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
                 raise ValueError("`charge_spin` is required for this SeZM descriptor.")
             charge_spin = xp.reshape(
                 xp_asarray_nodetach(
-                    xp, np.asarray(self.default_chg_spin), dtype=dtype, device=device
+                    xp, self.default_chg_spin, dtype=dtype, device=device
                 ),
                 (1, 2),
             )
@@ -2195,6 +2277,40 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         elif charge_spin.shape[0] != nf:
             raise ValueError("`charge_spin` first dimension must match nframes.")
         return charge_spin
+
+    def _gate_partial_exchange(
+        self,
+        partials: Array,
+        comm_dict: dict[str, Array],
+    ) -> Array:
+        """Complete the SFPG per-node partials across ranks.
+
+        Reverse-accumulate ghost rows into their owners, then broadcast the
+        completed owner values back — the backend-specific pt_expt subclass
+        implements it on ``border_op_backward``/``border_op``; dpmodel is
+        the single-process reference and rejects comm outright.
+
+        Parameters
+        ----------
+        partials
+            (n_nodes, 2) float tensor of [log_eta, zero_count] partials.
+        comm_dict
+            The border-exchange control tensors.
+
+        Returns
+        -------
+        Array
+            The globally completed (n_nodes, 2) tensor.
+
+        Raises
+        ------
+        NotImplementedError
+            Always, in the dpmodel backend.
+        """
+        raise NotImplementedError(
+            "Multi-rank SFPG partial exchange (comm_dict) is not supported "
+            "in the dpmodel backend."
+        )
 
     def _block_comm(
         self,
@@ -2238,13 +2354,13 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
     def get_type_map(self) -> list[str]:
         return self.type_map if self.type_map is not None else []
 
+    def has_chg_spin_ebd(self) -> bool:
+        """Return whether a frame charge/spin condition is configured."""
+        return self.charge_spin_embedding is not None
+
     def get_dim_chg_spin(self) -> int:
         """Return the charge/spin condition width."""
         return 2 if self.add_chg_spin_ebd else 0
-
-    def has_default_chg_spin(self) -> bool:
-        """Return whether default charge/spin conditions are configured."""
-        return self.default_chg_spin is not None
 
     def get_default_chg_spin(self) -> list[float] | None:
         """Return default charge/spin conditions."""
@@ -2278,20 +2394,27 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         return True
 
     def has_message_passing_across_ranks(self) -> bool:
-        """Whether multi-rank inference needs cross-rank ghost exchange.
+        """SeZM reads ghost-neighbour features at every interaction block.
 
-        SeZM reads ghost-neighbour features at every interaction block; the
-        GRAPH lower implements the exchange via per-block ``border_op``
-        (pt_expt ``exchange_ghost_features``). Source Freeze Propagation
-        bridging is excluded: its per-node gate folds a node's entire
-        outgoing-edge set, which a single rank cannot observe for ghost
-        owners, so bridging models fail fast on multi-rank instead.
+        The GRAPH lower implements the exchange via per-block ``border_op``
+        (pt_expt ``exchange_ghost_features``), so multi-rank inference always
+        needs the with-comm artifact. Whether multi-rank is POSSIBLE at all
+        is :meth:`supports_edge_parallel`.
 
         The DENSE (nlist) lower remains comm-less — see
         :meth:`dense_lower_supports_comm`; the freeze machinery consults both
         so nlist-kind artifacts carry ``has_comm_artifact=False``.
         """
-        return self.bridging_switch is None
+        return True
+
+    def supports_edge_parallel(self) -> bool:
+        """Bridging included: multi-rank is supported for every SeZM config.
+
+        The SFPG per-node partials are completed across ranks by
+        ``_gate_partial_exchange`` (reverse-accumulate + broadcast) before
+        the gate is applied (issue #5906).
+        """
+        return True
 
     def dense_lower_supports_comm(self) -> bool:
         """The DPA4 dense (nlist) lower has no comm_dict implementation.
@@ -2316,8 +2439,10 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
             spin and charge_spin are threaded through ``call_graph`` like any
             other per-node/per-frame input, and bridging is applied inside
             the shared ``_run_graph`` forward with no extra threading (it
-            reads ``self.bridging_switch`` directly). Bridging models still
-            fail multi-rank fast via ``has_message_passing_across_ranks``.
+            reads ``self.bridging_switch`` directly). Bridging models are
+            multi-rank capable too: their SFPG per-node partials are
+            completed across ranks by ``_gate_partial_exchange`` before the
+            gate is applied (issue #5906).
         """
         return not self._graph_lower_disabled
 
@@ -2497,7 +2622,7 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         if self.use_env_seed:
             for key, value in self.env_seed_embedding.serialize()["@variables"].items():
                 variables[f"env_seed_embedding.{key}"] = value
-            if self.edge_norm:
+            if self.film_norm:
                 for key, value in self.film_scale_norm.serialize()[
                     "@variables"
                 ].items():
@@ -2604,7 +2729,7 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
             self.env_seed_embedding = load(
                 self.env_seed_embedding, "env_seed_embedding."
             )
-            if self.edge_norm:
+            if self.film_norm:
                 self.film_scale_norm = load(self.film_scale_norm, "film_scale_norm.")
                 self.film_shift_norm = load(self.film_shift_norm, "film_shift_norm.")
             self.film_scale_strength_log = np.asarray(
@@ -2634,6 +2759,68 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         # === Output FFN ===
         self.output_ffn._load_variables(take_prefix("output_ffn."))
 
+    def _migrate_variables(
+        self,
+        variables: dict[str, Any],
+        version: float,
+        prefix: str = "",
+    ) -> float:
+        """Rewrite stored variables whose meaning changed since ``version``.
+
+        Operates on the flat mapping keyed by ``state_dict`` names, BEFORE
+        anything is assigned to a module: ``load_state_dict`` restores a
+        module's own buffers before descending into its children, so a
+        migration applied to live attributes would rewrite values the child
+        load is about to overwrite. Only representations are upgraded here;
+        a difference no rewrite can absorb stays a forward-time branch on
+        :attr:`version`, so a migrated descriptor never changes its own math.
+
+        Version 1.2 moved the env-seed spin gate from the spin coordinate to
+        the resulting environment quadratic form. For an active-spin model,
+        squaring the stored amplitude preserves the represented function.
+        Legacy native-spin models with no magnetic types instead carry
+        dormant, unconstrained spin-route values; those output-controlling
+        values are canonicalized to the zero function before the routes can
+        be activated by fine-tuning. Versions below 1.1 predate the
+        native-spin route and retain their original forward semantics.
+
+        Parameters
+        ----------
+        variables
+            Stored variables keyed by ``state_dict`` name, mutated in place.
+        version
+            Version the variables were written at.
+        prefix
+            Key prefix of this descriptor within ``variables``.
+
+        Returns
+        -------
+        float
+            Version the variables express after migration.
+        """
+        if not 1.1 <= version < 1.2:
+            return version
+
+        gate_key = prefix + "env_seed_embedding.spin_scale"
+        if self.use_spin is not None and not any(self.use_spin):
+            # dpmodel serialization names NativeLayer weights ``matrix``;
+            # pt_expt state dictionaries expose the wrapped attribute as ``w``.
+            dormant_keys = (
+                "spin_embedding.mag_layer2.matrix",
+                "spin_embedding.mag_layer2.w",
+                "spin_embedding.adam_spin_vec_weight",
+                "spin_embedding.adam_spin_nbr_weight",
+                "env_seed_embedding.spin_scale",
+            )
+            for name in dormant_keys:
+                key = prefix + name
+                if key in variables:
+                    xp = array_api_compat.array_namespace(variables[key])
+                    variables[key] = xp.zeros_like(variables[key])
+        elif gate_key in variables:
+            variables[gate_key] = variables[gate_key] ** 2
+        return 1.2
+
     def serialize(self) -> dict[str, Any]:
         return {
             "@class": "Descriptor",
@@ -2656,7 +2843,11 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
                 "basis_type": self.basis_type,
                 "n_radial": self.n_radial,
                 "radial_mlp": self.radial_mlp,
-                "edge_norm": self.edge_norm,
+                "edge_norm": [
+                    self.radial_norm,
+                    self.film_norm,
+                    self.focus_norm,
+                ],
                 "use_env_seed": self.use_env_seed,
                 "random_gamma": self.random_gamma,
                 "edge_cartesian": self.edge_cartesian,
@@ -2723,7 +2914,7 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         data.pop("env_mat", None)
         config.pop("s2_grid_resolution", None)
         obj = cls(**config)
-        obj.version = version
+        obj.version = obj._migrate_variables(variables, version)
         obj._load_variables(variables)
         return obj
 

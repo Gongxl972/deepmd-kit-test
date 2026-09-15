@@ -2,7 +2,7 @@
 """pt_expt ZBL bridging as COMPOSITION (review 3638077323, redesigned).
 
 ``bridging_method: ZBL`` builds a linear composition
-(``LinearEnergyModel`` over ``[learned, InterPotentialAtomicModel]`` with
+(``LinearEnergyModel`` over ``[learned, InnerPotentialAtomicModel]`` with
 ``weights="sum"``); eager values still match pt's flag-architected
 ``SeZMModel`` bit-for-bit (identical math), pinned here as a value
 regression together with FD force, export/DeepEval e2e, training smoke,
@@ -220,15 +220,15 @@ class TestZBLBridgingPtExpt:
             out["energy"], out2["energy"], rtol=1e-12, atol=1e-12
         )
 
-    def test_with_comm_gate_off_for_composition(self) -> None:
-        """Compositions never compile a with-comm artifact (single-rank)."""
+    def test_with_comm_gate_on_for_composition(self) -> None:
+        """The SFPG exchange makes bridged compositions multi-rank
+        (issue #5906 Task 2): the graph with-comm artifact is compiled.
+        """
         from deepmd.pt_expt.utils.serialization import (
             _needs_with_comm_artifact,
         )
 
-        assert (
-            _needs_with_comm_artifact(self.pt_expt_model, lower_kind="graph") is False
-        )
+        assert _needs_with_comm_artifact(self.pt_expt_model, lower_kind="graph") is True
 
     def test_pt_bridging_checkpoint_rejected(self) -> None:
         """Reject pt's flag-serialized bridging checkpoints.
@@ -275,10 +275,12 @@ def _spin_system():
 class TestNativeSpinWithBridging:
     """Native spin + analytical bridging compose (review 3649276109).
 
-    ``get_standard_model`` OWNS assembling the atomic model, bridging
-    composition included, and the native-spin wrapper re-classes whatever it
-    returns -- so the two features combine with no special case: the learned
-    child consumes ``spin``, the analytical child accepts and ignores it.
+    ``get_sezm_model`` OWNS the bridging composition (``get_standard_model``
+    rejects ``bridging_method``: a composition is not expressible on a
+    non-composite model type). ``get_native_spin_model`` routes DPA4/SeZM
+    configs there and then RE-CLASSES the returned composition -- so the two
+    features combine with no special case: the learned child consumes
+    ``spin``, the analytical child accepts and ignores it.
     """
 
     def test_construction_composes_and_keeps_spin(self) -> None:
@@ -290,7 +292,7 @@ class TestNativeSpinWithBridging:
         assert isinstance(model, NativeSpinEnergyModel)
         assert model.has_spin() is True
         kinds = [type(c).__name__ for c in model.atomic_model.models]
-        assert kinds[1] == "InterPotentialAtomicModel", kinds
+        assert kinds[1] == "InnerPotentialAtomicModel", kinds
         # bridging radii still reach the LEARNED child's descriptor
         assert float(model.atomic_model.models[0].descriptor.inner_clamp.r_inner) == 0.8
 
@@ -361,7 +363,7 @@ def test_native_spin_with_bridging_dpmodel() -> None:
     model = dp_get_model(cfg)
     assert isinstance(model, NativeSpinEnergyModelDP)
     kinds = [type(c).__name__ for c in model.atomic_model.models]
-    assert kinds[1] == "InterPotentialAtomicModel", kinds
+    assert kinds[1] == "InnerPotentialAtomicModel", kinds
 
     coord, atype, spin, box = _spin_system()
     out = model.call(coord.numpy(), atype.numpy(), spin.numpy(), box=box.numpy())
@@ -414,8 +416,11 @@ class TestZBLBridgingExportAndTraining:
 
         with zipfile.ZipFile(model_file) as z:
             md = json.loads(z.read("model/extra/metadata.json").decode("utf-8"))
-        # single-rank contract: compositions never get a with-comm artifact
-        assert md["has_comm_artifact"] is False
+        # multi-rank contract (issue #5906): the SFPG partials are completed
+        # across ranks, so a bridged composition DOES get a with-comm twin
+        assert md["has_comm_artifact"] is True
+        with zipfile.ZipFile(model_file) as z:
+            assert "model/extra/forward_lower_with_comm.pt2" in z.namelist()
 
         dp = DeepPot(str(model_file))
         e, f, v = dp.eval(
@@ -506,12 +511,12 @@ class TestZBLBridgingExportAndTraining:
             os.chdir(old_cwd)
 
 
-class TestInterPotentialChangeTypeMapPtExpt:
+class TestInnerPotentialChangeTypeMapPtExpt:
     """pt_expt twin of the dpmodel ``change_type_map`` regression.
 
     Exercised through the REAL composition: ``LinearEnergyModel`` ->
-    ``LinearEnergyAtomicModel`` -> ``InterPotentialAtomicModel`` ->
-    ``InterPotential``.  Inside a pt_expt module tree the element lookup is a
+    ``LinearEnergyAtomicModel`` -> ``InnerPotentialAtomicModel`` ->
+    ``InnerPotential``.  Inside a pt_expt module tree the element lookup is a
     wrapped torch buffer, so the rebuild must land on the same
     device/namespace (review 3649295675) -- a numpy rebuild would desync the
     buffer or fail outright on CUDA.
@@ -643,14 +648,17 @@ def test_native_spin_with_bridging_graph_freeze_and_deep_eval(tmp_path) -> None:
 
     model_file = tmp_path / "dpa4_native_spin_zbl_graph.pt2"
     # native spin has no dense lower at all, so the graph kind is the only
-    # valid one here; the composition additionally forbids a with-comm twin.
+    # valid one here; since issue #5906 the graph lower additionally carries
+    # a with-comm twin (only the dense lower stays single-rank for spin).
     deserialize_to_file(
         str(model_file), {"model": model.serialize()}, lower_kind="graph"
     )
     with zipfile.ZipFile(model_file) as z:
         md = json.loads(z.read("model/extra/metadata.json").decode("utf-8"))
+        names = z.namelist()
     assert md["is_spin"] is True
-    assert md["has_comm_artifact"] is False
+    assert md["has_comm_artifact"] is True
+    assert "model/extra/forward_lower_with_comm.pt2" in names
     assert md["use_spin"] == [True, False]
 
     dp = DeepPot(str(model_file))
@@ -694,7 +702,7 @@ def test_bridged_metadata_carries_charge_spin_dim(tmp_path) -> None:
     config = copy.deepcopy(ZBL_CONFIG)
     config["descriptor"]["add_chg_spin_ebd"] = True
     model = get_model(config).to(torch.device("cpu")).eval()
-    meta = _collect_metadata(model, is_spin=False, lower_kind="graph")
+    meta = _collect_metadata(model, lower_kind="graph")
     assert meta["dim_chg_spin"] > 0, (
         "the bridged model's metadata dropped charge_spin; the exported "
         "artifact would silently ignore the FiLM conditioning"
@@ -705,7 +713,7 @@ def test_bridged_metadata_carries_charge_spin_dim(tmp_path) -> None:
     for key in ("bridging_method", "bridging_r_inner", "bridging_r_outer"):
         plain.pop(key, None)
     plain_model = get_model(plain).to(torch.device("cpu")).eval()
-    plain_meta = _collect_metadata(plain_model, is_spin=False, lower_kind="graph")
+    plain_meta = _collect_metadata(plain_model, lower_kind="graph")
     assert meta["dim_chg_spin"] == plain_meta["dim_chg_spin"]
 
 
