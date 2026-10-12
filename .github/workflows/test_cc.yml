@@ -66,10 +66,13 @@ jobs:
               --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu \
               --torch-backend cpu
             source/install/uv_with_retry.sh pip install --system \
-              -e .[cpu,test,lmp,ipi,jax,torch] mpi4py
+              .[cpu,test,lmp,ipi,jax,torch] mpi4py
           else
+            # Paddle 后端：强制禁用 TensorFlow/PyTorch C++ 后端，防止构建脚本误找
+            export DP_ENABLE_TENSORFLOW=0
+            export DP_ENABLE_PYTORCH=0
             source/install/uv_with_retry.sh pip install --system \
-              -e .[cpu,test,lmp,ipi] mpi4py
+              .[cpu,test,lmp,ipi] mpi4py
             source/install/uv_with_retry.sh pip install --system paddlepaddle
           fi
       - name: Export backend roots (for TF/PT)
@@ -77,10 +80,8 @@ jobs:
         run: |
           echo "TENSORFLOW_ROOT=$(python -c 'import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec("tensorflow").origin).parent)')" >> "$GITHUB_ENV"
           echo "PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')" >> "$GITHUB_ENV"
-      # ---- 模型转换（原版步骤，确保测试模型就绪） ----
       - name: Convert models
         run: source/tests/infer/convert-models.sh
-      # ---- 内核参数修复（仅 memleak 时需要） ----
       - name: Fix kernel mmap rnd bits
         if: matrix.memleak
         run: sudo sysctl vm.mmap_rnd_bits=28
@@ -93,11 +94,9 @@ jobs:
           CXXFLAGS: ${{ matrix.memleak && '-fsanitize=leak -g' || '-g' }}
           LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/workflows/suppr.txt
         run: source/install/test_cc_local.sh
-      # ---- 收集 Paddle 额外动态库（仅 paddle 后端） ----
       - name: Collect Paddle extra libraries
         if: matrix.enable_paddle == 'TRUE'
         run: |
-          # 假设 test_cc_local.sh 已将 paddle 推理库放在 source/build_tests/paddle_inference_install_dir
           PADDLE_DIR="${{ github.workspace }}/source/build_tests/paddle_inference_install_dir"
           if [ -d "$PADDLE_DIR" ]; then
             cp -v "$PADDLE_DIR/paddle/lib/"*.so* dp_test/lib/ 2>/dev/null || true
@@ -106,12 +105,10 @@ jobs:
           else
             echo "Warning: Paddle inference directory not found at $PADDLE_DIR"
           fi
-      # ---- 复制模型文件到 dp_test（确保下游有完整模型） ----
       - name: Copy model files to dp_test
         run: |
           mkdir -p dp_test/tests
           cp -r source/tests/infer dp_test/tests/
-      # ---- 验证 bundle 完整性（可选，帮助调试） ----
       - name: Verify bundle contents
         run: |
           echo "=== bin ==="
@@ -160,7 +157,6 @@ jobs:
         with:
           name: dp-${{ matrix.backend }}-memleak-false
           path: dp_test/
-      # ---- 安装 Python 依赖（使用 pip/uv 缓存加速，但仍需安装 deepmd 包本身） ----
       - name: Install Python deps (LAMMPS)
         run: |
           if [ "${{ matrix.backend }}" = "tf_torch" ]; then
@@ -168,10 +164,10 @@ jobs:
               --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu \
               --torch-backend cpu
             source/install/uv_with_retry.sh pip install --system \
-              -e .[cpu,test,lmp,ipi,jax,torch] mpi4py
+              .[cpu,test,lmp,ipi,jax,torch] mpi4py
           else
             source/install/uv_with_retry.sh pip install --system \
-              -e .[cpu,test,lmp,ipi] mpi4py
+              .[cpu,test,lmp,ipi] mpi4py
             source/install/uv_with_retry.sh pip install --system paddlepaddle
           fi
       - name: Run LAMMPS tests
@@ -182,7 +178,6 @@ jobs:
           export OMP_NUM_THREADS=1
           export TF_INTRA_OP_PARALLELISM_THREADS=1
           export TF_INTER_OP_PARALLELISM_THREADS=1
-          # 使用 retry 增加稳定性（原版做法）
           source/install/retry_on_sigterm.sh 3 pytest --cov=deepmd source/lmp/tests
         env:
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow }}
@@ -232,10 +227,10 @@ jobs:
               --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu \
               --torch-backend cpu
             source/install/uv_with_retry.sh pip install --system \
-              -e .[cpu,test,ipi,jax,torch] i-PI mpi4py
+              .[cpu,test,ipi,jax,torch] i-PI mpi4py
           else
             source/install/uv_with_retry.sh pip install --system \
-              -e .[cpu,test,ipi] i-PI mpi4py
+              .[cpu,test,ipi] i-PI mpi4py
             source/install/uv_with_retry.sh pip install --system paddlepaddle
           fi
       - name: Run iPI tests
