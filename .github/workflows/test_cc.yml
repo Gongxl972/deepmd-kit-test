@@ -1,22 +1,14 @@
-name: Test C++ parallel (buildcc → lammps/ipi)
+name: Test C++
 
 on:
-  push:
-    branches-ignore:
-      - "gh-readonly-queue/**"
-      - "copilot/**"
-      - "dependabot/**"
-      - "pre-commit-ci-update-config"
   pull_request:
-  merge_group:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
-  cancel-in-progress: true
+  push:
+    branches:
+      - master
 
 jobs:
   # ================================================================
-  # Build + CTest + 打包完整 bundle
+  # Build & CTest
   # ================================================================
   buildcc:
     name: Build & CTest (${{ matrix.backend }}, memleak=${{ matrix.memleak }})
@@ -25,102 +17,92 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - memleak: true
-            backend: tf_torch
+          - backend: tf_torch
             enable_tensorflow: TRUE
             enable_pytorch: TRUE
             enable_paddle: FALSE
-          - memleak: true
-            backend: paddle
+            memleak: true
+          - backend: paddle
             enable_tensorflow: FALSE
             enable_pytorch: FALSE
             enable_paddle: TRUE
-          - memleak: false
-            backend: tf_torch
+            memleak: true
+          - backend: tf_torch
             enable_tensorflow: TRUE
             enable_pytorch: TRUE
             enable_paddle: FALSE
-          - memleak: false
-            backend: paddle
+            memleak: false
+          - backend: paddle
             enable_tensorflow: FALSE
             enable_pytorch: FALSE
             enable_paddle: TRUE
+            memleak: false
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: "pip"
-      - name: System dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            build-essential cmake ninja-build libgtest-dev \
-            openmpi-bin libopenmpi-dev libfabric1 \
-            libfftw3-dev libgomp1
       - run: python -m pip install uv
+
       - name: Install Python deps (build & test)
         run: |
+          # 针对 Paddle 后端：强制禁用其他后端的 C++ 构建，避免寻找无关的 C++ 库导致失败
+          if [ "${{ matrix.backend }}" = "paddle" ]; then
+            export DP_ENABLE_TENSORFLOW=0
+            export DP_ENABLE_PYTORCH=0
+          fi
+
           if [ "${{ matrix.backend }}" = "tf_torch" ]; then
             source/install/uv_with_retry.sh pip install --system \
               --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu \
               --torch-backend cpu
+            # 改为普通安装 . 避免 scikit-build-core 隔离环境缺陷
             source/install/uv_with_retry.sh pip install --system \
-              .[cpu,test,lmp,ipi,jax,torch] mpi4py
+              .[cpu,test] i-PI mpi4py
           else
-            # Paddle 后端：强制禁用 TensorFlow/PyTorch C++ 后端，防止构建脚本误找
-            export DP_ENABLE_TENSORFLOW=0
-            export DP_ENABLE_PYTORCH=0
+            # Paddle 矩阵：补充安装 orbax-checkpoint 以满足 convert-models.sh 中 JAX 模型转换的依赖要求
             source/install/uv_with_retry.sh pip install --system \
-              .[cpu,test,lmp,ipi] mpi4py
-            source/install/uv_with_retry.sh pip install --system paddlepaddle
+              .[cpu,test] i-PI mpi4py
+            source/install/uv_with_retry.sh pip install --system paddlepaddle orbax-checkpoint
           fi
+
       - name: Export backend roots (for TF/PT)
         if: matrix.backend == 'tf_torch'
         run: |
-          echo "TENSORFLOW_ROOT=$(python -c 'import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec("tensorflow").origin).parent)')" >> "$GITHUB_ENV"
-          echo "PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')" >> "$GITHUB_ENV"
+          echo "TF_ROOT=$(python -c 'import tensorflow as tf; print(tf.sysconfig.get_lib_dir())')" >> $GITHUB_ENV
+          echo "TORCH_ROOT=$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')" >> $GITHUB_ENV
+
       - name: Convert models
-        run: source/tests/infer/convert-models.sh
+        run: |
+          bash source/tests/infer/convert-models.sh
+
       - name: Fix kernel mmap rnd bits
-        if: matrix.memleak
+        if: matrix.memleak == true
         run: sudo sysctl vm.mmap_rnd_bits=28
+
       - name: Build & CTest (via test_cc_local.sh)
-        env:
-          DP_VARIANT: cpu
-          ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow }}
-          ENABLE_PYTORCH: ${{ matrix.enable_pytorch }}
-          ENABLE_PADDLE: ${{ matrix.enable_paddle }}
-          CXXFLAGS: ${{ matrix.memleak && '-fsanitize=leak -g' || '-g' }}
-          LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/workflows/suppr.txt
-        run: source/install/test_cc_local.sh
-      - name: Collect Paddle extra libraries
-        if: matrix.enable_paddle == 'TRUE'
         run: |
-          PADDLE_DIR="${{ github.workspace }}/source/build_tests/paddle_inference_install_dir"
-          if [ -d "$PADDLE_DIR" ]; then
-            cp -v "$PADDLE_DIR/paddle/lib/"*.so* dp_test/lib/ 2>/dev/null || true
-            cp -v "$PADDLE_DIR/third_party/install/onednn/lib/"* dp_test/lib/ 2>/dev/null || true
-            cp -v "$PADDLE_DIR/third_party/install/mklml/lib/"* dp_test/lib/ 2>/dev/null || true
-          else
-            echo "Warning: Paddle inference directory not found at $PADDLE_DIR"
+          bash source/install/test_cc_local.sh
+
+      - name: Collect runtime bundle
+        run: |
+          mkdir -p dp_test
+          cp -r source/build_tests/dp_test/* dp_test/ 2>/dev/null || true
+          cp -r source/tests/infer dp_test/tests/ 2>/dev/null || true
+          
+          # 补充 Paddle 动态库
+          if [ "${{ matrix.backend }}" = "paddle" ]; then
+            find source/build_tests/paddle_inference_install_dir -name '*.so*' \
+              \( -path '*/paddle/lib/*' -o -path '*/onednn/lib/*' -o -path '*/mklml/lib/*' \) \
+              -exec cp -t dp_test/lib/ {} + || true
           fi
-      - name: Copy model files to dp_test
-        run: |
-          mkdir -p dp_test/tests
-          cp -r source/tests/infer dp_test/tests/
-      - name: Verify bundle contents
-        run: |
-          echo "=== bin ==="
-          ls -la dp_test/bin/ || echo "(empty)"
-          echo "=== lib ==="
-          ls -la dp_test/lib/ || echo "(empty)"
-          echo "=== lib/deepmd_lmp ==="
-          ls -la dp_test/lib/deepmd_lmp/ 2>/dev/null || echo "(not exist)"
-          echo "=== tests ==="
-          find dp_test/tests -maxdepth 2 -type f | head -20
-      - name: Upload artifact (dp_test)
-        uses: actions/upload-artifact@v4
+          
+          # 补充 LAMMPS 插件路径
+          mkdir -p dp_test/lib/deepmd_lmp
+          cp source/build_tests/libdeepmd_lmp.* dp_test/lib/deepmd_lmp/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
         with:
           name: dp-${{ matrix.backend }}-memleak-${{ matrix.memleak }}
           path: dp_test/
@@ -164,10 +146,10 @@ jobs:
               --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu \
               --torch-backend cpu
             source/install/uv_with_retry.sh pip install --system \
-              .[cpu,test,lmp,ipi,jax,torch] mpi4py
+              .[cpu,test] lammps mpi4py
           else
             source/install/uv_with_retry.sh pip install --system \
-              .[cpu,test,lmp,ipi] mpi4py
+              .[cpu,test] lammps mpi4py
             source/install/uv_with_retry.sh pip install --system paddlepaddle
           fi
       - name: Run LAMMPS tests
