@@ -1,4 +1,4 @@
-、name: Test C++ parallel (unified build → lammps/ipi)
+name: Test C++ parallel (unified build → lammps/ipi)
 
 on:
   push:
