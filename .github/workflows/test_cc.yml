@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   # ================================================================
-  # Build + CTest (直接复用 test_cc_local.sh)
+  # Build + CTest + 打包完整 bundle
   # ================================================================
   buildcc:
     name: Build & CTest (${{ matrix.backend }}, memleak=${{ matrix.memleak }})
@@ -77,6 +77,13 @@ jobs:
         run: |
           echo "TENSORFLOW_ROOT=$(python -c 'import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec("tensorflow").origin).parent)')" >> "$GITHUB_ENV"
           echo "PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')" >> "$GITHUB_ENV"
+      # ---- 模型转换（原版步骤，确保测试模型就绪） ----
+      - name: Convert models
+        run: source/tests/infer/convert-models.sh
+      # ---- 内核参数修复（仅 memleak 时需要） ----
+      - name: Fix kernel mmap rnd bits
+        if: matrix.memleak
+        run: sudo sysctl vm.mmap_rnd_bits=28
       - name: Build & CTest (via test_cc_local.sh)
         env:
           DP_VARIANT: cpu
@@ -86,16 +93,42 @@ jobs:
           CXXFLAGS: ${{ matrix.memleak && '-fsanitize=leak -g' || '-g' }}
           LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/workflows/suppr.txt
         run: source/install/test_cc_local.sh
-      - name: Copy model files to dp_test for downstream
+      # ---- 收集 Paddle 额外动态库（仅 paddle 后端） ----
+      - name: Collect Paddle extra libraries
+        if: matrix.enable_paddle == 'TRUE'
+        run: |
+          # 假设 test_cc_local.sh 已将 paddle 推理库放在 source/build_tests/paddle_inference_install_dir
+          PADDLE_DIR="${{ github.workspace }}/source/build_tests/paddle_inference_install_dir"
+          if [ -d "$PADDLE_DIR" ]; then
+            cp -v "$PADDLE_DIR/paddle/lib/"*.so* dp_test/lib/ 2>/dev/null || true
+            cp -v "$PADDLE_DIR/third_party/install/onednn/lib/"* dp_test/lib/ 2>/dev/null || true
+            cp -v "$PADDLE_DIR/third_party/install/mklml/lib/"* dp_test/lib/ 2>/dev/null || true
+          else
+            echo "Warning: Paddle inference directory not found at $PADDLE_DIR"
+          fi
+      # ---- 复制模型文件到 dp_test（确保下游有完整模型） ----
+      - name: Copy model files to dp_test
         run: |
           mkdir -p dp_test/tests
           cp -r source/tests/infer dp_test/tests/
-      - name: Upload artifact (dp_test only)
+      # ---- 验证 bundle 完整性（可选，帮助调试） ----
+      - name: Verify bundle contents
+        run: |
+          echo "=== bin ==="
+          ls -la dp_test/bin/ || echo "(empty)"
+          echo "=== lib ==="
+          ls -la dp_test/lib/ || echo "(empty)"
+          echo "=== lib/deepmd_lmp ==="
+          ls -la dp_test/lib/deepmd_lmp/ 2>/dev/null || echo "(not exist)"
+          echo "=== tests ==="
+          find dp_test/tests -maxdepth 2 -type f | head -20
+      - name: Upload artifact (dp_test)
         uses: actions/upload-artifact@v4
         with:
           name: dp-${{ matrix.backend }}-memleak-${{ matrix.memleak }}
           path: dp_test/
           retention-days: 1
+          if-no-files-found: error
 
   # ================================================================
   # LAMMPS tests (仅 non-memleak)
@@ -127,6 +160,7 @@ jobs:
         with:
           name: dp-${{ matrix.backend }}-memleak-false
           path: dp_test/
+      # ---- 安装 Python 依赖（使用 pip/uv 缓存加速，但仍需安装 deepmd 包本身） ----
       - name: Install Python deps (LAMMPS)
         run: |
           if [ "${{ matrix.backend }}" = "tf_torch" ]; then
@@ -144,15 +178,22 @@ jobs:
         run: |
           export PATH="$PWD/dp_test/bin:$PATH"
           export LD_LIBRARY_PATH="$PWD/dp_test/lib:$LD_LIBRARY_PATH"
+          export LAMMPS_PLUGIN_PATH="$PWD/dp_test/lib/deepmd_lmp"
           export OMP_NUM_THREADS=1
           export TF_INTRA_OP_PARALLELISM_THREADS=1
           export TF_INTER_OP_PARALLELISM_THREADS=1
-          pytest source/lmp/tests
+          # 使用 retry 增加稳定性（原版做法）
+          source/install/retry_on_sigterm.sh 3 pytest --cov=deepmd source/lmp/tests
         env:
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch }}
           ENABLE_JAX: ${{ matrix.enable_tensorflow }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle }}
+      - name: Upload coverage to Codecov (non-blocking)
+        uses: codecov/codecov-action@v7
+        continue-on-error: true
+        with:
+          use_oidc: true
 
   # ================================================================
   # iPI tests (仅 non-memleak)
@@ -204,12 +245,17 @@ jobs:
           export OMP_NUM_THREADS=1
           export TF_INTRA_OP_PARALLELISM_THREADS=1
           export TF_INTER_OP_PARALLELISM_THREADS=1
-          pytest source/ipi/tests
+          pytest --cov=deepmd source/ipi/tests
         env:
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch }}
           ENABLE_JAX: ${{ matrix.enable_tensorflow }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle }}
+      - name: Upload coverage to Codecov (non-blocking)
+        uses: codecov/codecov-action@v7
+        continue-on-error: true
+        with:
+          use_oidc: true
 
   # ================================================================
   # Pass gate
