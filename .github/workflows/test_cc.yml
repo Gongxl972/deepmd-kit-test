@@ -56,6 +56,7 @@ jobs:
             source/install/uv_with_retry.sh pip install --system \
               -e .[cpu,test,lmp,ipi,jax,torch] mpi4py
           else
+            # Paddle 矩阵：只安装基础测试依赖和 paddlepaddle，严禁安装 torch/jax
             source/install/uv_with_retry.sh pip install --system \
               -e .[cpu,test,lmp,ipi] mpi4py
             source/install/uv_with_retry.sh pip install --system paddlepaddle
@@ -71,7 +72,9 @@ jobs:
           ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow }}
           ENABLE_PYTORCH: ${{ matrix.enable_pytorch }}
           ENABLE_PADDLE: ${{ matrix.enable_paddle }}
-          CXXFLAGS: "-g"   # non-memleak
+          # 强制使用 C++20 以兼容新版 PyTorch 头文件
+          CMAKE_ARGS: "-DCMAKE_CXX_STANDARD=20 -DCMAKE_CXX_STANDARD_REQUIRED=ON"
+          CXXFLAGS: "-g"
         run: source/install/test_cc_local.sh
       - name: Copy model files to dp_test for downstream
         run: |
