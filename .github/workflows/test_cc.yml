@@ -1,4 +1,4 @@
-name: Test C++ parallel (unified build → lammps/ipi)
+name: Test C++ parallel (split build → lammps/ipi)
 
 on:
   push:
@@ -16,11 +16,23 @@ concurrency:
 
 jobs:
   # ================================================================
-  # Unified build: compile all backends (TF, PT, Paddle) once
+  # Build per backend (tf_torch or paddle)
   # ================================================================
-  build_all:
-    name: Build all backends (TF+PT+Paddle)
+  buildcc:
+    name: Build (${{ matrix.backend }})
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: tf_torch
+            enable_tensorflow: TRUE
+            enable_pytorch: TRUE
+            enable_paddle: FALSE
+          - backend: paddle
+            enable_tensorflow: FALSE
+            enable_pytorch: FALSE
+            enable_paddle: TRUE
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -35,34 +47,40 @@ jobs:
             openmpi-bin libopenmpi-dev libfabric1 \
             libfftw3-dev libgomp1
       - run: python -m pip install uv
-      - name: Install all Python deps (TF, PT, JAX, Paddle)
+      - name: Install Python deps (build & test)
         run: |
-          source/install/uv_with_retry.sh pip install --system \
-            --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu \
-            --torch-backend cpu
-          source/install/uv_with_retry.sh pip install --system \
-            -e .[cpu,test,lmp,ipi,jax,torch] mpi4py
-          source/install/uv_with_retry.sh pip install --system paddlepaddle
+          if [ "${{ matrix.backend }}" = "tf_torch" ]; then
+            source/install/uv_with_retry.sh pip install --system \
+              --group pin_tensorflow_cpu --group pin_pytorch_cpu --group pin_jax_cpu \
+              --torch-backend cpu
+            source/install/uv_with_retry.sh pip install --system \
+              -e .[cpu,test,lmp,ipi,jax,torch] mpi4py
+          else
+            source/install/uv_with_retry.sh pip install --system \
+              -e .[cpu,test,lmp,ipi] mpi4py
+            source/install/uv_with_retry.sh pip install --system paddlepaddle
+          fi
       - name: Export backend roots (for TF/PT)
+        if: matrix.backend == 'tf_torch'
         run: |
           echo "TENSORFLOW_ROOT=$(python -c 'import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec("tensorflow").origin).parent)')" >> "$GITHUB_ENV"
           echo "PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')" >> "$GITHUB_ENV"
-      - name: Build & CTest (all backends)
+      - name: Build & CTest (via test_cc_local.sh)
         env:
           DP_VARIANT: cpu
-          ENABLE_TENSORFLOW: TRUE
-          ENABLE_PYTORCH: TRUE
-          ENABLE_PADDLE: TRUE
+          ENABLE_TENSORFLOW: ${{ matrix.enable_tensorflow }}
+          ENABLE_PYTORCH: ${{ matrix.enable_pytorch }}
+          ENABLE_PADDLE: ${{ matrix.enable_paddle }}
           CXXFLAGS: "-g"   # non-memleak
         run: source/install/test_cc_local.sh
       - name: Copy model files to dp_test for downstream
         run: |
           mkdir -p dp_test/tests
           cp -r source/tests/infer dp_test/tests/
-      - name: Upload artifact (dp_all)
+      - name: Upload artifact (dp-${{ matrix.backend }})
         uses: actions/upload-artifact@v4
         with:
-          name: dp-all
+          name: dp-${{ matrix.backend }}
           path: dp_test/
           retention-days: 1
 
@@ -71,7 +89,7 @@ jobs:
   # ================================================================
   test_lammps:
     name: LAMMPS (${{ matrix.backend }})
-    needs: build_all
+    needs: buildcc
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -94,7 +112,7 @@ jobs:
       - run: python -m pip install uv
       - uses: actions/download-artifact@v4
         with:
-          name: dp-all
+          name: dp-${{ matrix.backend }}
           path: dp_test/
       - name: Install Python deps (LAMMPS)
         run: |
@@ -129,7 +147,7 @@ jobs:
   # ================================================================
   test_ipi:
     name: iPI (${{ matrix.backend }})
-    needs: build_all
+    needs: buildcc
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -152,7 +170,7 @@ jobs:
       - run: python -m pip install uv
       - uses: actions/download-artifact@v4
         with:
-          name: dp-all
+          name: dp-${{ matrix.backend }}
           path: dp_test/
       - name: Install Python deps (iPI)
         run: |
@@ -186,7 +204,7 @@ jobs:
   # ================================================================
   pass:
     name: Pass testing C++
-    needs: [build_all, test_lammps, test_ipi]
+    needs: [buildcc, test_lammps, test_ipi]
     runs-on: ubuntu-slim
     if: always()
     steps:
